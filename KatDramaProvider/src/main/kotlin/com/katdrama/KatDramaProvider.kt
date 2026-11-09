@@ -434,50 +434,34 @@ class KatDramaProvider : MainAPI() {
 
     // ---- Load links (episode -> HubCloud 1080p direct, then Streamtape / Streamwish) ----
 
-    // Resolve the HubCloud (and GDFlix) direct link for a file id.
-    // The file page (links.kmhd.me/file/<id>) is locked behind a SvelteKit
-    // form: GET it, POST ?/unlock with a Referer header, then GET it again.
-    // The unlocked page embeds upload_links:{hubdrive_res:"...",gdflix_res:"..."}.
+    // The site's public API gives a file's upload links directly, no unlock
+    // page or session cookie needed. Token is the site's own public JWT
+    // (embedded in every links.kmhd.me page, expires 2027).
+    private val apiToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbiIsImV4cCI6MTgwNzQ4NDIzMywiaWF0IjoxNzA3NDg0MjMzfQ.7u5bF9PcMhvClSDZgsd6EU-CQnp1Ec--wsezkDEgiZo"
+
+    // Resolve a file id to its hosts via the API:
+    // GET api.dandndn.one/api/v1/file/<id> -> upload_links:{hubdrive_res, gdflix_res, streamtape_res, streamwish_res}
     private suspend fun resolveFileHosts(fileId: String): Map<String, String> {
-        val fileUrl = "https://links.kmhd.me/file/$fileId"
-        var html = try { app.get(fileUrl, headers = browserHeaders).text } catch (e: Exception) { return emptyMap() }
-        if (!html.contains("hubdrive_res")) {
-            // Locked page: the unlock form action is "?/unlock&redirect=<base64>"
-            // (note: the HTML has "&amp;" and there is NO "locked?redirect=" in
-            // the page, so match the form action, not the page URL).
-            val redirect = Regex("unlock(?:&amp;|&)redirect=([A-Za-z0-9+/=]+)").find(html)?.groupValues?.getOrNull(1)
-            if (redirect != null) {
-                val lockedUrl = "https://links.kmhd.me/locked?redirect=$redirect"
-                var cookieHeader: String? = null
-                try {
-                    val resp = app.post(
-                        "https://links.kmhd.me/locked?/unlock&redirect=$redirect",
-                        headers = browserHeaders + mapOf(
-                            "Referer" to lockedUrl,
-                            "Origin" to "https://links.kmhd.me",
-                            "Content-Type" to "application/x-www-form-urlencoded"
-                        ),
-                        data = mapOf()
-                    )
-                    val cookies = resp.headers.values("Set-Cookie")
-                    if (cookies.isNotEmpty()) {
-                        cookieHeader = cookies.joinToString("; ") { it.substringBefore(";").trim() }
-                    }
-                } catch (e: Exception) { /* ignore, re-fetch below */ }
-                val getHeaders = if (cookieHeader != null) {
-                    browserHeaders + mapOf("Cookie" to cookieHeader)
-                } else {
-                    browserHeaders
-                }
-                html = try { app.get(fileUrl, headers = getHeaders).text } catch (e: Exception) { return emptyMap() }
-            }
+        val json = try {
+            app.get(
+                "https://api.dandndn.one/api/v1/file/$fileId",
+                headers = mapOf("Authorization" to "Bearer $apiToken") + browserHeaders
+            ).text
+        } catch (e: Exception) {
+            return emptyMap()
         }
         val out = mutableMapOf<String, String>()
-        Regex("hubdrive_res:\"([^\"]+)\"").find(html)?.groupValues?.getOrNull(1)?.let {
+        Regex("hubdrive_res\":\"([^\"]+)\"").find(json)?.groupValues?.getOrNull(1)?.let {
             if (it != "None") out["hubcloud"] = "https://hubcloud.ist/drive/$it"
         }
-        Regex("gdflix_res:\"([^\"]+)\"").find(html)?.groupValues?.getOrNull(1)?.let {
+        Regex("gdflix_res\":\"([^\"]+)\"").find(json)?.groupValues?.getOrNull(1)?.let {
             if (it != "None") out["gdflix"] = "https://gd.kmhd.me/file/$it"
+        }
+        Regex("streamtape_res\":\"([^\"]+)\"").find(json)?.groupValues?.getOrNull(1)?.let {
+            if (it != "None") out["streamtape"] = "https://streamtape.com/e/$it"
+        }
+        Regex("streamwish_res\":\"([^\"]+)\"").find(json)?.groupValues?.getOrNull(1)?.let {
+            if (it != "None") out["streamwish"] = "https://hglink.to/e/$it"
         }
         return out
     }
@@ -503,14 +487,26 @@ class KatDramaProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val ep = tryParseJson<EpisodeData>(data) ?: return false
-        val playId = ep.playId ?: return false
+        val playId = ep.playId
         val fileIds = listOfNotNull(ep.f1080, ep.f720, ep.f480)
         var found = false
 
-        // 1) Best quality first: HubCloud 1080p direct file (resolved ourselves,
-        // because CloudStream's built-in HubCloud extractor does not handle it)
-        for (fileId in fileIds) {
+        // All hosts come from the API (resolveFileHosts): HubCloud, GDFlix,
+        // Streamtape, Streamwish. Try 1080p, then 720p, then 480p file ids.
+        // HubCloud direct first (best quality + embedded subtitles).
+        for ((idx, fileId) in fileIds.withIndex()) {
             val hosts = resolveFileHosts(fileId)
+            if (hosts.isEmpty()) continue
+            val quality = when (idx) {
+                0 -> Qualities.P1080.value
+                1 -> Qualities.P720.value
+                else -> Qualities.P480.value
+            }
+            val qName = when (idx) {
+                0 -> "1080p"
+                1 -> "720p"
+                else -> "480p"
+            }
             val hub = hosts["hubcloud"]
             if (!hub.isNullOrEmpty()) {
                 val hubCode = hub.substringAfterLast("/").trim()
@@ -519,32 +515,44 @@ class KatDramaProvider : MainAPI() {
                     callback(
                         newExtractorLink(
                             source = "HubCloud",
-                            name = "HubCloud 1080p",
+                            name = "HubCloud $qName",
                             url = direct,
                             type = ExtractorLinkType.VIDEO
                         ) {
-                            this.quality = Qualities.P1080.value
+                            this.quality = quality
                             this.referer = "https://hubcloud.pw/"
                         }
                     )
-                    return true
-                }
-                // Fallback: let CloudStream's own extractor try the HubCloud page
-                if (loadExtractor(hub, subtitleCallback, callback)) {
-                    return true
+                    found = true
+                } else if (loadExtractor(hub, subtitleCallback, callback)) {
+                    found = true
                 }
             }
             val gd = hosts["gdflix"]
             if (!gd.isNullOrEmpty()) {
                 if (loadExtractor(gd, subtitleCallback, callback)) {
                     found = true
-                    break
                 }
             }
+            val st = hosts["streamtape"]
+            if (!st.isNullOrEmpty()) {
+                if (loadExtractor(st, subtitleCallback, callback)) {
+                    found = true
+                }
+            }
+            val sw = hosts["streamwish"]
+            if (!sw.isNullOrEmpty()) {
+                if (loadExtractor(sw, subtitleCallback, callback)) {
+                    found = true
+                }
+            }
+            if (found) break
         }
         if (found) return true
 
-        // 2) Fallback: Streamtape / Streamwish via the play page
+        // Fallback: Streamtape / Streamwish via the play page (when the
+        // episode has no file ids, e.g. Watch Online only)
+        if (playId == null) return false
         val html = try { app.get("https://links.kmhd.me/play?id=$playId", headers = browserHeaders).text } catch (e: Exception) { return false }
         val info = parsePlayInfo(html)
         for (fileId in fileIds) {

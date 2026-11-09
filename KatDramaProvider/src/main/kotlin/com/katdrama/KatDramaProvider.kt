@@ -234,6 +234,25 @@ class KatDramaProvider : MainAPI() {
 
     // ---- Load (detail page -> episodes) ----
 
+    // A "complete season" post lists packs: links.kmhd.me/pack/<id> per quality.
+    // The pack page embeds info:{<fileId>:{name:"... S01E06 ..."}} for every episode.
+    // Returns episode number -> file id.
+    private suspend fun fetchPackEpisodes(packId: String): Map<Int, String> {
+        val html = try { app.get("https://links.kmhd.me/pack/$packId").text } catch (e: Exception) { return emptyMap() }
+        val out = mutableMapOf<Int, String>()
+        // Entries look like: True_ac159f13:{name:"True Beauty S01E06 480p ..."}
+        val entryRe = Regex("([A-Za-z0-9_]+):\\{name:\"([^\"]+)\"\\}")
+        for (m in entryRe.findAll(html)) {
+            val fileId = m.groupValues[1]
+            val name = m.groupValues[2]
+            val epNum = Regex("(?i)S\\d+E(\\d+)").find(name)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                ?: Regex("(?i)E(\\d+)").find(name)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                ?: continue
+            out[epNum] = fileId
+        }
+        return out
+    }
+
     override suspend fun load(url: String): LoadResponse? {
         val html = app.get(url).text
         val doc = Jsoup.parse(html)
@@ -323,6 +342,62 @@ class KatDramaProvider : MainAPI() {
                     this.posterUrl = poster
                 }
             )
+        }
+        // Complete-season posts: no "Episode NN" headings, but pack links
+        // (links.kmhd.me/pack/<id>) per quality. Fetch each pack and merge
+        // episode file ids by episode number.
+        if (episodes.isEmpty()) {
+            // Collect pack links with their quality label
+            val packs = mutableListOf<Pair<String, String>>() // (quality, packId)
+            for (el in cdoc.select("a")) {
+                val href = el.attr("href")
+                if (href.contains("links.kmhd.me/pack/")) {
+                    val packId = href.substringAfterLast("/").trim()
+                    val label = el.text().trim()
+                    val quality = when {
+                        label.contains("2160", true) -> "2160"
+                        label.contains("1080", true) -> "1080"
+                        label.contains("720", true) -> "720"
+                        label.contains("480", true) -> "480"
+                        else -> "?"
+                    }
+                    if (packId.isNotEmpty()) packs.add(quality to packId)
+                }
+            }
+            if (packs.isNotEmpty()) {
+                // episode -> (f1080, f720, f480)
+                val byEp = mutableMapOf<Int, Triple<String?, String?, String?>>()
+                for ((quality, packId) in packs) {
+                    val eps = fetchPackEpisodes(packId)
+                    for ((epNum, fileId) in eps) {
+                        val cur = byEp[epNum] ?: Triple(null, null, null)
+                        byEp[epNum] = when (quality) {
+                            "1080", "2160" -> cur.copy(first = fileId)
+                            "720" -> cur.copy(second = fileId)
+                            "480" -> cur.copy(third = fileId)
+                            else -> if (cur.first == null) cur.copy(first = fileId) else cur
+                        }
+                    }
+                }
+                for ((epNum, triple) in byEp.toSortedMap()) {
+                    val (f1080p, f720p, f480p) = triple
+                    if (f1080p == null && f720p == null && f480p == null) continue
+                    val data = EpisodeData(playId, f1080p, f720p, f480p)
+                    val json = try {
+                        com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(data)
+                    } catch (e: Exception) {
+                        ""
+                    }
+                    episodes.add(
+                        newEpisode(json) {
+                            this.name = "Episode $epNum"
+                            this.episode = epNum
+                            this.season = 1
+                            this.posterUrl = poster
+                        }
+                    )
+                }
+            }
         }
         // Fallback: if no file links were found at all, still offer the Watch Online link
         if (episodes.isEmpty() && playId != null) {

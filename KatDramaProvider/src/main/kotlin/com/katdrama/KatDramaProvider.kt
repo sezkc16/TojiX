@@ -471,7 +471,10 @@ class KatDramaProvider : MainAPI() {
     // -> direct file. The gamerxyt page gives EITHER a Cloudflare R2 .mkv
     // URL or Pixeldrain links (page URL, NOT playable) -> convert those to
     // the Pixeldrain direct API URL (pixeldrain.dev/api/file/<id>), which
-    // IS a playable video file. Returns the direct URL or null.
+    // IS a playable video file. NOTE: the page lists several Pixeldrain
+    // links and some are DEAD (404, e.g. "negn6f" appears on many pages),
+    // so validate each with a HEAD request and return the first that
+    // actually exists. Returns the direct URL or null.
     private suspend fun resolveHubCloudDirect(hubCode: String): String? {
         val hubUrl = "https://hubcloud.ist/drive/$hubCode"
         val hubHtml = try { app.get(hubUrl, headers = browserHeaders).text } catch (e: Exception) { return null }
@@ -481,11 +484,17 @@ class KatDramaProvider : MainAPI() {
         // 1) Direct file: https://<hash>.r2.cloudflarestorage.com/hub/<hash>?X-Amz-...
         Regex("https?://[^\"' ]+\\.r2\\.cloudflarestorage\\.com/[^\"' ]+")
             .find(gamerHtml)?.value?.let { return it }
-        // 2) Pixeldrain page link -> direct API file URL (playable video)
-        Regex("https?://pixeldrain\\.dev/u/([A-Za-z0-9]+)")
-            .find(gamerHtml)?.groupValues?.getOrNull(1)?.let {
-                return "https://pixeldrain.dev/api/file/$it"
-            }
+        // 2) Pixeldrain page links -> direct API file URLs; try each until
+        // one actually exists (HEAD 200), because some are dead (404).
+        val pdIds = Regex("https?://pixeldrain\\.dev/u/([A-Za-z0-9]+)")
+            .findAll(gamerHtml).map { it.groupValues[1] }.distinct().toList()
+        for (id in pdIds) {
+            val apiUrl = "https://pixeldrain.dev/api/file/$id"
+            val ok = try {
+                app.head(apiUrl, headers = browserHeaders).code == 200
+            } catch (e: Exception) { false }
+            if (ok) return apiUrl
+        }
         return null
     }
 

@@ -1,5 +1,5 @@
 // Use an integer for version numbers
-version = 11
+version = 12
 
 cloudstream {
     description = "Watch K-Dramas, C-Dramas and Hindi Dubbed series from KatDrama"

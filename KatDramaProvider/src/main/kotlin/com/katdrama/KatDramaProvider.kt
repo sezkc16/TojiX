@@ -272,6 +272,7 @@ class KatDramaProvider : MainAPI() {
                         this.name = "Episode $currentEp"
                         this.episode = currentEp
                         this.season = 1
+                        this.posterUrl = poster
                     }
                 )
                 // Only reset after an episode was actually added, so the
@@ -319,6 +320,7 @@ class KatDramaProvider : MainAPI() {
                     this.name = title
                     this.episode = 1
                     this.season = 1
+                    this.posterUrl = poster
                 }
             )
         }
@@ -335,6 +337,7 @@ class KatDramaProvider : MainAPI() {
                     this.name = title
                     this.episode = 1
                     this.season = 1
+                    this.posterUrl = poster
                 }
             )
         }

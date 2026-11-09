@@ -137,14 +137,12 @@ class KatDramaProvider : MainAPI() {
 
     private fun parseListData(html: String): ListData? {
         // The list payload lives in: __sveltekit_*.resolve({id:1,data:{success:true,data:{items:[...],page:1,...}}})
+        // The object right after "data:{success:true,data:" IS the list data:
+        // {items:[...],page:1,perPage:12,totalItems:...,totalPages:...}
         val marker = "data:{success:true,data:"
-        val idx = html.indexOf(marker)
-        if (idx < 0) return null
+        if (!html.contains(marker)) return null
         val obj = extractBalanced(html, marker, '{', '}') ?: return null
-        // obj = {success:true,data:{items:[...],page:1,perPage:12,totalItems:...,totalPages:...}}
-        // We only need the inner data:{...}
-        val inner = extractBalanced(obj, "data:", '{', '}') ?: return null
-        return tryParseJson<ListData>(quoteJsKeys(inner))
+        return tryParseJson<ListData>(quoteJsKeys(obj))
     }
 
     private fun parsePostContent(html: String): String? {

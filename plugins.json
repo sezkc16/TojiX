@@ -1,0 +1,392 @@
+[
+    {
+        "iconUrl": "https://anikoto.cz/AnikotoTheme/assets/images/favicon.png",
+        "jarFileSize": 192790,
+        "fileHash": "sha256-b48617fedb7aa52630e52ecfadd18e3efe761955cb01ccc86f92ff5769a0ab0d",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/sezkc16/TojiX",
+        "fileSize": 55793,
+        "status": 1,
+        "authors": [
+            "Toji"
+        ],
+        "tvTypes": [
+            "Anime",
+            "AnimeMovie"
+        ],
+        "version": 3,
+        "internalName": "AnikotoProvider",
+        "jarUrl": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/AnikotoProvider.jar",
+        "description": "Watch Anime Sub & Dub from Anikoto",
+        "url": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/AnikotoProvider.cs3",
+        "name": "AnikotoProvider",
+        "jarHash": "sha256-83f9e9f68c45787f6c01f617a0da22efe881a93fb51a7c9a5b4237242f730bf9"
+    },
+    {
+        "iconUrl": "https://bflixcdn.xyz/wp-content/uploads/2023/05/Bollyflix-movies.png",
+        "jarFileSize": 101773,
+        "fileHash": "sha256-9e85a59f638cecfc454d59de46e6b06f4e05c73733676fd76b3480ae226a2f75",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/sezkc16/TojiX",
+        "fileSize": 30277,
+        "status": 1,
+        "authors": [
+            "Toji"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 6,
+        "internalName": "BollyFlixProvider",
+        "jarUrl": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/BollyFlixProvider.jar",
+        "description": "Movies & Web Series from BollyFlix",
+        "url": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/BollyFlixProvider.cs3",
+        "name": "BollyFlixProvider",
+        "jarHash": "sha256-8c5a4b73468d5fd8aaa0c19a394dcf487fcd07d1dd8bb4b9af40a2fdf95a7da6"
+    },
+    {
+        "iconUrl": "https://cinejoy.pk/pwa-512.png",
+        "jarFileSize": 121132,
+        "fileHash": "sha256-6dab49a293c1a6b0ec74eb7a13747b9da6a0f77bd2c4e34b624fabb5544c4a98",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/sezkc16/TojiX",
+        "fileSize": 38329,
+        "status": 1,
+        "authors": [
+            "Toji"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 3,
+        "internalName": "CinejoyProvider",
+        "jarUrl": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/CinejoyProvider.jar",
+        "description": "Watch the latest movies and TV series on Cinejoy",
+        "url": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/CinejoyProvider.cs3",
+        "name": "CinejoyProvider",
+        "jarHash": "sha256-8536314035d3b4e8cff718fcd45472171a5fc04399e460234dbe1707fb936983"
+    },
+    {
+        "iconUrl": "https://new1.cinevood.plus/wp-content/uploads/2020/07/favicon2.png",
+        "jarFileSize": 95355,
+        "fileHash": "sha256-10aa19104dab8333ebd49f8444fca17d461ba3bfb234016b7f61056a2cb58b79",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/sezkc16/TojiX",
+        "fileSize": 29070,
+        "status": 1,
+        "authors": [
+            "Toji"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 4,
+        "internalName": "CineVoodProvider",
+        "jarUrl": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/CineVoodProvider.jar",
+        "description": "Download HD Movies & TV Shows from CineVood",
+        "url": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/CineVoodProvider.cs3",
+        "name": "CineVoodProvider",
+        "jarHash": "sha256-88d953d20ae418deef01d23448e09e2a360debfe01bbd2bcaf37421aa7afcd5a"
+    },
+    {
+        "iconUrl": "https://4khdhub.one/apple-touch-icon.png",
+        "jarFileSize": 132516,
+        "fileHash": "sha256-2ae65a2342203c91b67f88323470d1ae5643fc284b58c2d8b5aed6fdb477a785",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/sezkc16/TojiX",
+        "fileSize": 37143,
+        "status": 1,
+        "authors": [
+            "Toji"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 7,
+        "internalName": "FourKHDHubProvider",
+        "jarUrl": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/FourKHDHubProvider.jar",
+        "description": "Movies & TV Shows in 4K HDR, 2160p, 1080p from 4KHDHub",
+        "url": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/FourKHDHubProvider.cs3",
+        "name": "FourKHDHubProvider",
+        "jarHash": "sha256-0d3ec134cf8c6424dee310c29e6c837523bf2ea545f99e779234ed11b1e6489c"
+    },
+    {
+        "iconUrl": "https://gokuhd.nl/wp-content/uploads/2025/07/Goku-Favicon.png",
+        "jarFileSize": 139018,
+        "fileHash": "sha256-bb26b6e5937b9c1c57b4eb30eed571c7eb4a7abdf6e1b30ea0bbfb2b9506f774",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/sezkc16/TojiX",
+        "fileSize": 39291,
+        "status": 1,
+        "authors": [
+            "Toji"
+        ],
+        "tvTypes": [
+            "Anime",
+            "AnimeMovie"
+        ],
+        "version": 4,
+        "internalName": "GokuHDProvider",
+        "jarUrl": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/GokuHDProvider.jar",
+        "description": "Hindi Dubbed Anime Series & Anime Movies from GokuHD",
+        "url": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/GokuHDProvider.cs3",
+        "name": "GokuHDProvider",
+        "jarHash": "sha256-c6c580a7919cc624e005a651f74553d4d729e013f07a6005524288ef5a77169b"
+    },
+    {
+        "iconUrl": "https://new14.hdhub4u.cl/wp-content/uploads/2021/05/cropped-cropped-1-1-1-2-1-192x192.png",
+        "jarFileSize": 154373,
+        "fileHash": "sha256-73b11c64d0d7de335c4580c1d33ee04730e9f36a5974109f775391f63ff9330c",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/sezkc16/TojiX",
+        "fileSize": 42833,
+        "status": 1,
+        "authors": [
+            "Toji"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 11,
+        "internalName": "HDHub4uProvider",
+        "jarUrl": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/HDHub4uProvider.jar",
+        "description": "Download HD Movies & TV Shows from HDHub4u",
+        "url": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/HDHub4uProvider.cs3",
+        "name": "HDHub4uProvider",
+        "jarHash": "sha256-6ad21683ad82bc24aaf16206761dc2ba1eb75061f121f8f8e43b44a4d35c0b82"
+    },
+    {
+        "iconUrl": "https://hicine.biz/favicon.svg",
+        "jarFileSize": 164739,
+        "fileHash": "sha256-f42a9f97c737c17bc21c7f6c16bd79ea560412fc9d4a938e768ea80afca08d4f",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/sezkc16/TojiX",
+        "fileSize": 38275,
+        "status": 1,
+        "authors": [
+            "Toji"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 3,
+        "internalName": "HiCineProvider",
+        "jarUrl": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/HiCineProvider.jar",
+        "description": "Movies, Series & Anime from HiCine",
+        "url": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/HiCineProvider.cs3",
+        "name": "HiCineProvider",
+        "jarHash": "sha256-a8b2cef3b30fe42702b86a471d3e6cbd351cd109228f92e4b05df9ec12abd1e6"
+    },
+    {
+        "iconUrl": "https://catimages.org/images/2026/05/05/cropped-KATDRAMA-fab.png",
+        "jarFileSize": 125763,
+        "fileHash": "sha256-dd7eb2cff378139d42c5b914feccb30c1f7aea858eafec2a03a08d0e90eaba98",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/sezkc16/TojiX",
+        "fileSize": 38213,
+        "status": 1,
+        "authors": [
+            "Toji"
+        ],
+        "tvTypes": [
+            "TvSeries"
+        ],
+        "version": 15,
+        "internalName": "KatDramaProvider",
+        "jarUrl": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/KatDramaProvider.jar",
+        "description": "Watch K-Dramas, C-Dramas and Hindi Dubbed series from KatDrama",
+        "url": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/KatDramaProvider.cs3",
+        "name": "KatDramaProvider",
+        "jarHash": "sha256-1df9fef6a080a46ba457e6d4f9271437f2515d9fba22dc9b5c9c6558d518ef81"
+    },
+    {
+        "iconUrl": "https://new.katmoviehd.top/favicon.png",
+        "jarFileSize": 199938,
+        "fileHash": "sha256-cb8291547a1c8191e8112211066aad2eba7ece3deadc7424347b21059e5ff1b2",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/sezkc16/TojiX",
+        "fileSize": 53808,
+        "status": 1,
+        "authors": [
+            "Toji"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 4,
+        "internalName": "KatMovieHDProvider",
+        "jarUrl": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/KatMovieHDProvider.jar",
+        "description": "Watch Bollywood, Hollywood, Hindi Dubbed movies and web series from KatMovieHD",
+        "url": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/KatMovieHDProvider.cs3",
+        "name": "KatMovieHDProvider",
+        "jarHash": "sha256-5cca31b2e7ad8897515f8de6eeb22cacd14ab89d5946e92ea7444e3951fb0e27"
+    },
+    {
+        "iconUrl": "https://miruro.cx/icon-output.png",
+        "jarFileSize": 224788,
+        "fileHash": "sha256-a376bf985e8d10607ec7e58325b7dc06a8cd267de149bd5cb1b306ef32dc13b1",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/sezkc16/TojiX",
+        "fileSize": 60215,
+        "status": 1,
+        "authors": [
+            "Toji"
+        ],
+        "tvTypes": [
+            "Anime",
+            "AnimeMovie"
+        ],
+        "version": 7,
+        "internalName": "MiruroProvider",
+        "jarUrl": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/MiruroProvider.jar",
+        "description": "Watch Anime Sub & Dub from Miruro",
+        "url": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/MiruroProvider.cs3",
+        "name": "MiruroProvider",
+        "jarHash": "sha256-d80f6024b40c80f3c1232be0c42fa7aa4e04eb08c6a7868972cefb53129d2cba"
+    },
+    {
+        "iconUrl": "https://movies4u.gp/wp-content/uploads/2025/09/cropped-faviconV2-300x300.png",
+        "jarFileSize": 115923,
+        "fileHash": "sha256-dbf63a8548d1cebc3aee168d17e1342ec3b749eee81e7ae21b84d2539df10aa3",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/sezkc16/TojiX",
+        "fileSize": 32377,
+        "status": 1,
+        "authors": [
+            "Toji"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 6,
+        "internalName": "Movies4uProvider",
+        "jarUrl": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/Movies4uProvider.jar",
+        "description": "Movies, Web Series & TV Shows from Movies4u",
+        "url": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/Movies4uProvider.cs3",
+        "name": "Movies4uProvider",
+        "jarHash": "sha256-73d4780e7a2bc8bbfa6e0dfd2273e5be73feaeec3dd3ed04d530b91597a1bae0"
+    },
+    {
+        "iconUrl": "https://new3.moviesdrive.cyou/wp-content/uploads/2026/01/cropped-Gemini_Generated_Image_qt93aqt93aqt93aq-1-192x192.png",
+        "jarFileSize": 118350,
+        "fileHash": "sha256-0cf9d00bd270a03a0f91f5161b42b769123c0ac50f608f13e39030cc08ddc1c5",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/sezkc16/TojiX",
+        "fileSize": 32953,
+        "status": 1,
+        "authors": [
+            "Toji"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 6,
+        "internalName": "MoviesDriveProvider",
+        "jarUrl": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/MoviesDriveProvider.jar",
+        "description": "Movies & Web Series from MoviesDrive",
+        "url": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/MoviesDriveProvider.cs3",
+        "name": "MoviesDriveProvider",
+        "jarHash": "sha256-7e1b176d18931ea2c8ce53dfc9019bb3dd987ed0ce984059fcf1608163e61343"
+    },
+    {
+        "iconUrl": "https://moviesmod.fi/wp-content/uploads/2024/06/favicon-3-200x200.png",
+        "jarFileSize": 265620,
+        "fileHash": "sha256-f4d28f6c3182f56db1ad025e0736a794a2c7c6a31ed89b7d12fcff6b24232a16",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/sezkc16/TojiX",
+        "fileSize": 62710,
+        "status": 1,
+        "authors": [
+            "Toji"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 5,
+        "internalName": "MoviesModProvider",
+        "jarUrl": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/MoviesModProvider.jar",
+        "description": "MoviesMod | Movies Mod 2025, MoviesMod Official",
+        "url": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/MoviesModProvider.cs3",
+        "name": "MoviesModProvider",
+        "jarHash": "sha256-2b20e9f5037f525186f830b26670f838d2241d5815f0d2da9e921ddb7bd3020f"
+    },
+    {
+        "iconUrl": "https://site3.ssrmovies.page/wp-content/uploads/2024/10/SSRmovies.COM-Icon.png",
+        "jarFileSize": 130071,
+        "fileHash": "sha256-fbb0bdf9068cb3b5eda4f3cd424456e62f071436e01449ab43b9a83c061d3711",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/sezkc16/TojiX",
+        "fileSize": 36170,
+        "status": 1,
+        "authors": [
+            "Toji"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 10,
+        "internalName": "SSRMoviesProvider",
+        "jarUrl": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/SSRMoviesProvider.jar",
+        "description": "Bollywood & Hollywood dual audio Hindi movies and web series from SSRMovies",
+        "url": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/SSRMoviesProvider.cs3",
+        "name": "SSRMoviesProvider",
+        "jarHash": "sha256-0f9d85a6c0f9024f51b9c04feb8a20b99e8886841bf85d898e0326a3bbb7ed7f"
+    },
+    {
+        "iconUrl": "https://uhdmovies.ceo/wp-content/uploads/2021/03/cropped-output-onlinepngtools-1-192x192.png",
+        "jarFileSize": 225029,
+        "fileHash": "sha256-9a4655826e08d9adf9e2390880102014a35ba6eae8b7e59452cd0a959dba1c43",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/sezkc16/TojiX",
+        "fileSize": 55159,
+        "status": 1,
+        "authors": [
+            "Toji"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 4,
+        "internalName": "UHDMoviesProvider",
+        "jarUrl": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/UHDMoviesProvider.jar",
+        "description": "Download 4k Dual Audio Movies, 1080p Movies, 2160p HDR Movies & TV Series",
+        "url": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/UHDMoviesProvider.cs3",
+        "name": "UHDMoviesProvider",
+        "jarHash": "sha256-641d6a6eea2be25ac9e4589df7beae48d93f41c624fb83e355abf0bfb1f40620"
+    },
+    {
+        "iconUrl": "https://vegamovies13.co.in/templates/vegamovies/images/v-l-200x300.png",
+        "jarFileSize": 93317,
+        "fileHash": "sha256-ddc57cfae823141ca12a19846d0288c076e608ae3bfa3fcc185d2884c5046926",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/sezkc16/TojiX",
+        "fileSize": 26754,
+        "status": 1,
+        "authors": [
+            "Toji"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 5,
+        "internalName": "VegamoviesProvider",
+        "jarUrl": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/VegamoviesProvider.jar",
+        "description": "Download Movies & Web Series from Vegamovies",
+        "url": "https://raw.githubusercontent.com/sezkc16/TojiX/builds/VegamoviesProvider.cs3",
+        "name": "VegamoviesProvider",
+        "jarHash": "sha256-c1c9057846e490287d7a52b190872d4ea979774b86f3f8a0011d271a7e8f5feb"
+    }
+]

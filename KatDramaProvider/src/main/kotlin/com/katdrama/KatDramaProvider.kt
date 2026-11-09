@@ -347,7 +347,43 @@ class KatDramaProvider : MainAPI() {
         }
     }
 
-    // ---- Load links (episode -> Streamtape / Streamwish) ----
+    // ---- Load links (episode -> HubCloud 1080p direct, then Streamtape / Streamwish) ----
+
+    // Resolve the HubCloud (and GDFlix) direct link for a file id.
+    // The file page (links.kmhd.me/file/<id>) is locked behind a SvelteKit
+    // form: GET it, POST ?/unlock with a Referer header, then GET it again.
+    // The unlocked page embeds upload_links:{hubdrive_res:"...",gdflix_res:"..."}.
+    private suspend fun resolveFileHosts(fileId: String): Map<String, String> {
+        val fileUrl = "https://links.kmhd.me/file/$fileId"
+        var html = try { app.get(fileUrl).text } catch (e: Exception) { return emptyMap() }
+        if (!html.contains("hubdrive_res")) {
+            // Locked page: extract the base64 redirect and unlock it
+            val redirect = Regex("locked\\?redirect=([A-Za-z0-9+/=]+)").find(html)?.groupValues?.getOrNull(1)
+            if (redirect != null) {
+                val lockedUrl = "https://links.kmhd.me/locked?redirect=$redirect"
+                try {
+                    app.post(
+                        "https://links.kmhd.me/locked?/unlock&redirect=$redirect",
+                        headers = mapOf(
+                            "Referer" to lockedUrl,
+                            "Origin" to "https://links.kmhd.me",
+                            "Content-Type" to "application/x-www-form-urlencoded"
+                        ),
+                        data = mapOf()
+                    )
+                } catch (e: Exception) { /* ignore, re-fetch below */ }
+                html = try { app.get(fileUrl).text } catch (e: Exception) { return emptyMap() }
+            }
+        }
+        val out = mutableMapOf<String, String>()
+        Regex("hubdrive_res:\"([^\"]+)\"").find(html)?.groupValues?.getOrNull(1)?.let {
+            if (it != "None") out["hubcloud"] = "https://hubcloud.ist/drive/$it"
+        }
+        Regex("gdflix_res:\"([^\"]+)\"").find(html)?.groupValues?.getOrNull(1)?.let {
+            if (it != "None") out["gdflix"] = "https://gd.kmhd.me/file/$it"
+        }
+        return out
+    }
 
     override suspend fun loadLinks(
         data: String,
@@ -357,12 +393,32 @@ class KatDramaProvider : MainAPI() {
     ): Boolean {
         val ep = tryParseJson<EpisodeData>(data) ?: return false
         val playId = ep.playId ?: return false
-        // Fetch the play page: it contains info:{<fileId>:{streamtape_res, streamwish_res}}
-        val html = app.get("https://links.kmhd.me/play?id=$playId").text
-        val info = parsePlayInfo(html)
-        // Try 1080p, then 720p, then 480p file ids
         val fileIds = listOfNotNull(ep.f1080, ep.f720, ep.f480)
         var found = false
+
+        // 1) Best quality first: HubCloud / GDFlix direct 1080p file
+        for (fileId in fileIds) {
+            val hosts = resolveFileHosts(fileId)
+            val hub = hosts["hubcloud"]
+            if (!hub.isNullOrEmpty()) {
+                if (loadExtractor(hub, subtitleCallback, callback)) {
+                    found = true
+                    break
+                }
+            }
+            val gd = hosts["gdflix"]
+            if (!gd.isNullOrEmpty()) {
+                if (loadExtractor(gd, subtitleCallback, callback)) {
+                    found = true
+                    break
+                }
+            }
+        }
+        if (found) return true
+
+        // 2) Fallback: Streamtape / Streamwish via the play page
+        val html = try { app.get("https://links.kmhd.me/play?id=$playId").text } catch (e: Exception) { return false }
+        val info = parsePlayInfo(html)
         for (fileId in fileIds) {
             val entry = info[fileId] ?: continue
             val st = entry.streamtapeRes

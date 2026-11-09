@@ -237,11 +237,17 @@ class KatDramaProvider : MainAPI() {
 
     // ---- Load (detail page -> episodes) ----
 
+    // Browser-like headers: links.kmhd.me / HubCloud may block the app's
+    // default client, so every request to those hosts sends a real UA.
+    private val browserHeaders = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+
     // A "complete season" post lists packs: links.kmhd.me/pack/<id> per quality.
     // The pack page embeds info:{<fileId>:{name:"... S01E06 ..."}} for every episode.
     // Returns episode number -> file id.
     private suspend fun fetchPackEpisodes(packId: String): Map<Int, String> {
-        val html = try { app.get("https://links.kmhd.me/pack/$packId").text } catch (e: Exception) { return emptyMap() }
+        val html = try { app.get("https://links.kmhd.me/pack/$packId", headers = browserHeaders).text } catch (e: Exception) { return emptyMap() }
         val out = mutableMapOf<Int, String>()
         // Entries look like: True_ac159f13:{name:"True Beauty S01E06 480p ..."}
         val entryRe = Regex("([A-Za-z0-9_]+):\\{name:\"([^\"]+)\"\\}")
@@ -328,27 +334,10 @@ class KatDramaProvider : MainAPI() {
         }
         flush()
 
-        // Movies / single-file posts: no "Episode NN" heading, just quality links
-        if (episodes.isEmpty() && (f1080 != null || f720 != null || f480 != null)) {
-            // f1080/f720/f480 were collected without an episode heading
-            val data = EpisodeData(playId, f1080, f720, f480)
-            val json = try {
-                com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(data)
-            } catch (e: Exception) {
-                ""
-            }
-            episodes.add(
-                newEpisode(json) {
-                    this.name = title
-                    this.episode = 1
-                    this.season = 1
-                    this.posterUrl = poster
-                }
-            )
-        }
         // Complete-season posts: no "Episode NN" headings, but pack links
         // (links.kmhd.me/pack/<id>) per quality. Fetch each pack and merge
-        // episode file ids by episode number.
+        // episode file ids by episode number. (Runs BEFORE the movie fallback,
+        // because the pack file links would otherwise be mistaken for a movie.)
         if (episodes.isEmpty()) {
             // Collect pack links with their quality label
             val packs = mutableListOf<Pair<String, String>>() // (quality, packId)
@@ -402,6 +391,24 @@ class KatDramaProvider : MainAPI() {
                 }
             }
         }
+        // Movies / single-file posts: no "Episode NN" heading, just quality links
+        if (episodes.isEmpty() && (f1080 != null || f720 != null || f480 != null)) {
+            // f1080/f720/f480 were collected without an episode heading
+            val data = EpisodeData(playId, f1080, f720, f480)
+            val json = try {
+                com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(data)
+            } catch (e: Exception) {
+                ""
+            }
+            episodes.add(
+                newEpisode(json) {
+                    this.name = title
+                    this.episode = 1
+                    this.season = 1
+                    this.posterUrl = poster
+                }
+            )
+        }
         // Fallback: if no file links were found at all, still offer the Watch Online link
         if (episodes.isEmpty() && playId != null) {
             val data = EpisodeData(playId, null, null, null)
@@ -433,7 +440,7 @@ class KatDramaProvider : MainAPI() {
     // The unlocked page embeds upload_links:{hubdrive_res:"...",gdflix_res:"..."}.
     private suspend fun resolveFileHosts(fileId: String): Map<String, String> {
         val fileUrl = "https://links.kmhd.me/file/$fileId"
-        var html = try { app.get(fileUrl).text } catch (e: Exception) { return emptyMap() }
+        var html = try { app.get(fileUrl, headers = browserHeaders).text } catch (e: Exception) { return emptyMap() }
         if (!html.contains("hubdrive_res")) {
             // Locked page: extract the base64 redirect and unlock it
             val redirect = Regex("locked\\?redirect=([A-Za-z0-9+/=]+)").find(html)?.groupValues?.getOrNull(1)
@@ -442,7 +449,7 @@ class KatDramaProvider : MainAPI() {
                 try {
                     app.post(
                         "https://links.kmhd.me/locked?/unlock&redirect=$redirect",
-                        headers = mapOf(
+                        headers = browserHeaders + mapOf(
                             "Referer" to lockedUrl,
                             "Origin" to "https://links.kmhd.me",
                             "Content-Type" to "application/x-www-form-urlencoded"
@@ -450,7 +457,7 @@ class KatDramaProvider : MainAPI() {
                         data = mapOf()
                     )
                 } catch (e: Exception) { /* ignore, re-fetch below */ }
-                html = try { app.get(fileUrl).text } catch (e: Exception) { return emptyMap() }
+                html = try { app.get(fileUrl, headers = browserHeaders).text } catch (e: Exception) { return emptyMap() }
             }
         }
         val out = mutableMapOf<String, String>()
@@ -468,10 +475,10 @@ class KatDramaProvider : MainAPI() {
     // -> direct Cloudflare R2 .mkv URL. Returns the direct URL or null.
     private suspend fun resolveHubCloudDirect(hubCode: String): String? {
         val hubUrl = "https://hubcloud.ist/drive/$hubCode"
-        val hubHtml = try { app.get(hubUrl).text } catch (e: Exception) { return null }
+        val hubHtml = try { app.get(hubUrl, headers = browserHeaders).text } catch (e: Exception) { return null }
         val gamerUrl = Regex("https?://gamerxyt\\.com/hubcloud\\.php\\?host=hubcloud&id=[A-Za-z0-9]+&token=[A-Za-z0-9]+")
             .find(hubHtml)?.value ?: return null
-        val gamerHtml = try { app.get(gamerUrl).text } catch (e: Exception) { return null }
+        val gamerHtml = try { app.get(gamerUrl, headers = browserHeaders).text } catch (e: Exception) { return null }
         // Direct file: https://<hash>.r2.cloudflarestorage.com/hub/<hash>?X-Amz-...
         return Regex("https?://[^\"' ]+\\.r2\\.cloudflarestorage\\.com/[^\"' ]+")
             .find(gamerHtml)?.value
@@ -526,7 +533,7 @@ class KatDramaProvider : MainAPI() {
         if (found) return true
 
         // 2) Fallback: Streamtape / Streamwish via the play page
-        val html = try { app.get("https://links.kmhd.me/play?id=$playId").text } catch (e: Exception) { return false }
+        val html = try { app.get("https://links.kmhd.me/play?id=$playId", headers = browserHeaders).text } catch (e: Exception) { return false }
         val info = parsePlayInfo(html)
         for (fileId in fileIds) {
             val entry = info[fileId] ?: continue

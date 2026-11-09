@@ -468,16 +468,25 @@ class KatDramaProvider : MainAPI() {
 
     // Resolve a HubCloud file id all the way to the direct video file.
     // Chain: hubcloud.ist/drive/<code> -> gamerxyt.php link (in the page)
-    // -> direct Cloudflare R2 .mkv URL. Returns the direct URL or null.
+    // -> direct file. The gamerxyt page gives EITHER a Cloudflare R2 .mkv
+    // URL or Pixeldrain links (page URL, NOT playable) -> convert those to
+    // the Pixeldrain direct API URL (pixeldrain.dev/api/file/<id>), which
+    // IS a playable video file. Returns the direct URL or null.
     private suspend fun resolveHubCloudDirect(hubCode: String): String? {
         val hubUrl = "https://hubcloud.ist/drive/$hubCode"
         val hubHtml = try { app.get(hubUrl, headers = browserHeaders).text } catch (e: Exception) { return null }
         val gamerUrl = Regex("https?://gamerxyt\\.com/hubcloud\\.php\\?host=hubcloud&id=[A-Za-z0-9]+&token=[A-Za-z0-9]+")
             .find(hubHtml)?.value ?: return null
         val gamerHtml = try { app.get(gamerUrl, headers = browserHeaders).text } catch (e: Exception) { return null }
-        // Direct file: https://<hash>.r2.cloudflarestorage.com/hub/<hash>?X-Amz-...
-        return Regex("https?://[^\"' ]+\\.r2\\.cloudflarestorage\\.com/[^\"' ]+")
-            .find(gamerHtml)?.value
+        // 1) Direct file: https://<hash>.r2.cloudflarestorage.com/hub/<hash>?X-Amz-...
+        Regex("https?://[^\"' ]+\\.r2\\.cloudflarestorage\\.com/[^\"' ]+")
+            .find(gamerHtml)?.value?.let { return it }
+        // 2) Pixeldrain page link -> direct API file URL (playable video)
+        Regex("https?://pixeldrain\\.dev/u/([A-Za-z0-9]+)")
+            .find(gamerHtml)?.groupValues?.getOrNull(1)?.let {
+                return "https://pixeldrain.dev/api/file/$it"
+            }
+        return null
     }
 
     override suspend fun loadLinks(

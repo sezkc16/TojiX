@@ -442,11 +442,10 @@ class KatDramaProvider : MainAPI() {
         val fileUrl = "https://links.kmhd.me/file/$fileId"
         var html = try { app.get(fileUrl, headers = browserHeaders).text } catch (e: Exception) { return emptyMap() }
         if (!html.contains("hubdrive_res")) {
-            // Locked page: extract the base64 redirect and unlock it.
-            // The unlock POST sets a session cookie; without it the file
-            // page just redirects back to /locked. So capture the cookie
-            // from the unlock response and send it explicitly on the re-fetch.
-            val redirect = Regex("locked\\?redirect=([A-Za-z0-9+/=]+)").find(html)?.groupValues?.getOrNull(1)
+            // Locked page: the unlock form action is "?/unlock&redirect=<base64>"
+            // (note: the HTML has "&amp;" and there is NO "locked?redirect=" in
+            // the page, so match the form action, not the page URL).
+            val redirect = Regex("unlock(?:&amp;|&)redirect=([A-Za-z0-9+/=]+)").find(html)?.groupValues?.getOrNull(1)
             if (redirect != null) {
                 val lockedUrl = "https://links.kmhd.me/locked?redirect=$redirect"
                 var cookieHeader: String? = null

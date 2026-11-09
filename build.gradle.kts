@@ -43,8 +43,6 @@ subprojects {
     }
 
     android {
-        namespace = "com.katdrama"
-
         defaultConfig {
             minSdk = 21
             compileSdkVersion(35)

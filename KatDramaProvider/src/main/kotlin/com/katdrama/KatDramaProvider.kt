@@ -442,12 +442,16 @@ class KatDramaProvider : MainAPI() {
         val fileUrl = "https://links.kmhd.me/file/$fileId"
         var html = try { app.get(fileUrl, headers = browserHeaders).text } catch (e: Exception) { return emptyMap() }
         if (!html.contains("hubdrive_res")) {
-            // Locked page: extract the base64 redirect and unlock it
+            // Locked page: extract the base64 redirect and unlock it.
+            // The unlock POST sets a session cookie; without it the file
+            // page just redirects back to /locked. So capture the cookie
+            // from the unlock response and send it explicitly on the re-fetch.
             val redirect = Regex("locked\\?redirect=([A-Za-z0-9+/=]+)").find(html)?.groupValues?.getOrNull(1)
             if (redirect != null) {
                 val lockedUrl = "https://links.kmhd.me/locked?redirect=$redirect"
+                var cookieHeader: String? = null
                 try {
-                    app.post(
+                    val resp = app.post(
                         "https://links.kmhd.me/locked?/unlock&redirect=$redirect",
                         headers = browserHeaders + mapOf(
                             "Referer" to lockedUrl,
@@ -456,8 +460,17 @@ class KatDramaProvider : MainAPI() {
                         ),
                         data = mapOf()
                     )
+                    val cookies = resp.headers.values("Set-Cookie")
+                    if (cookies.isNotEmpty()) {
+                        cookieHeader = cookies.joinToString("; ") { it.substringBefore(";").trim() }
+                    }
                 } catch (e: Exception) { /* ignore, re-fetch below */ }
-                html = try { app.get(fileUrl, headers = browserHeaders).text } catch (e: Exception) { return emptyMap() }
+                val getHeaders = if (cookieHeader != null) {
+                    browserHeaders + mapOf("Cookie" to cookieHeader)
+                } else {
+                    browserHeaders
+                }
+                html = try { app.get(fileUrl, headers = getHeaders).text } catch (e: Exception) { return emptyMap() }
             }
         }
         val out = mutableMapOf<String, String>()

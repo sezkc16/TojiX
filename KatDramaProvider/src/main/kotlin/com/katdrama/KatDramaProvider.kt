@@ -17,6 +17,10 @@ import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 import com.lagradost.cloudstream3.newTvSeriesSearchResponse
 import com.lagradost.cloudstream3.toNewSearchResponseList
+import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.StringUtils.encodeUri
@@ -460,6 +464,20 @@ class KatDramaProvider : MainAPI() {
         return out
     }
 
+    // Resolve a HubCloud file id all the way to the direct video file.
+    // Chain: hubcloud.ist/drive/<code> -> gamerxyt.php link (in the page)
+    // -> direct Cloudflare R2 .mkv URL. Returns the direct URL or null.
+    private suspend fun resolveHubCloudDirect(hubCode: String): String? {
+        val hubUrl = "https://hubcloud.ist/drive/$hubCode"
+        val hubHtml = try { app.get(hubUrl).text } catch (e: Exception) { return null }
+        val gamerUrl = Regex("https?://gamerxyt\\.com/hubcloud\\.php\\?host=hubcloud&id=[A-Za-z0-9]+&token=[A-Za-z0-9]+")
+            .find(hubHtml)?.value ?: return null
+        val gamerHtml = try { app.get(gamerUrl).text } catch (e: Exception) { return null }
+        // Direct file: https://<hash>.r2.cloudflarestorage.com/hub/<hash>?X-Amz-...
+        return Regex("https?://[^\"' ]+\\.r2\\.cloudflarestorage\\.com/[^\"' ]+")
+            .find(gamerHtml)?.value
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -471,14 +489,31 @@ class KatDramaProvider : MainAPI() {
         val fileIds = listOfNotNull(ep.f1080, ep.f720, ep.f480)
         var found = false
 
-        // 1) Best quality first: HubCloud / GDFlix direct 1080p file
+        // 1) Best quality first: HubCloud 1080p direct file (resolved ourselves,
+        // because CloudStream's built-in HubCloud extractor does not handle it)
         for (fileId in fileIds) {
             val hosts = resolveFileHosts(fileId)
             val hub = hosts["hubcloud"]
             if (!hub.isNullOrEmpty()) {
+                val hubCode = hub.substringAfterLast("/").trim()
+                val direct = resolveHubCloudDirect(hubCode)
+                if (!direct.isNullOrEmpty()) {
+                    callback(
+                        newExtractorLink(
+                            source = "HubCloud",
+                            name = "HubCloud 1080p",
+                            url = direct,
+                            type = ExtractorLinkType.VIDEO
+                        ) {
+                            this.quality = Qualities.P1080.value
+                            this.referer = "https://hubcloud.pw/"
+                        }
+                    )
+                    return true
+                }
+                // Fallback: let CloudStream's own extractor try the HubCloud page
                 if (loadExtractor(hub, subtitleCallback, callback)) {
-                    found = true
-                    break
+                    return true
                 }
             }
             val gd = hosts["gdflix"]

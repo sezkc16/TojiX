@@ -216,6 +216,7 @@ class VegamoviesProvider : MainAPI() {
                         this.name = "Complete (${sec.quality}$sizeSuffix)"
                         this.season = seasonNum
                         this.episode = 1
+                        this.posterUrl = poster
                     })
                 } else {
                     for (epNum in epNums) {
@@ -228,6 +229,7 @@ class VegamoviesProvider : MainAPI() {
                             this.name = "Episode $epNum (${sec.quality}$sizeSuffix)"
                             this.season = seasonNum
                             this.episode = epNum
+                            this.posterUrl = poster
                         })
                     }
                 }

@@ -26,6 +26,11 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import java.net.URLEncoder
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
+import org.jsoup.Jsoup
 
 /**
  * Miruro — free anime streaming (Sub & Dub).
@@ -36,6 +41,13 @@ import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
  * Miruro's own pipe API is Cloudflare-403 outside a browser, so it is not
  * used. Only megaplay + animegg work (26 other provider names 404,
  * anineko/animepahe 502).
+ *
+ * Fallback (v4): when justanime returns nothing (the core.justanime.to API
+ * is unreachable from some networks — confirmed on the user's phone on both
+ * mobile data and Wi-Fi), loadLinks falls back to the Anikoto megaplay
+ * chain (anikoto.cz AJAX -> megaplay.buzz embed -> getSourcesNew ->
+ * AES-256-CBC decrypt -> master.m3u8), searched by the anime title. The
+ * key/IV are the same megaplay pair used by the Anikoto provider.
  */
 class MiruroProvider : MainAPI() {
 
@@ -47,6 +59,12 @@ class MiruroProvider : MainAPI() {
 
     private val anilistUrl = "https://graphql.anilist.co"
     private val justAnimeApi = "https://core.justanime.to/api/watch"
+
+    // Anikoto fallback (only used when justanime returns nothing).
+    private val anikotoUrl = "https://anikoto.cz"
+    private val megaKeyStr = "i?LMTAx0Q6,:}50U"
+    private val megaIvStr = "W0;27ToaUpl_P%'c"
+    private val megaReferer = "https://megaplay.buzz/"
 
     private val ua =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -160,10 +178,43 @@ class MiruroProvider : MainAPI() {
         @JsonProperty("exp") val exp: String? = null,
     )
 
+    // ---- Anikoto fallback models ----
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class AkAjaxResult(
+        @JsonProperty("status") val status: Int? = null,
+        @JsonProperty("result") val result: String? = null,
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class AkServerGetResult(
+        @JsonProperty("url") val url: String? = null,
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class AkServerGetResp(
+        @JsonProperty("status") val status: Int? = null,
+        @JsonProperty("result") val result: AkServerGetResult? = null,
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class AkGsResp(
+        @JsonProperty("tracks") val tracks: List<JaTrack>? = null,
+        @JsonProperty("enc") val enc: String? = null,
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class AkMegaFile(
+        @JsonProperty("file") val file: String? = null,
+    )
+
+    private data class AkServerEntry(val type: String, val name: String, val linkId: String)
+
     // Data passed to loadLinks.
     data class EpisodeData(
         @JsonProperty("id") val id: Int,
         @JsonProperty("num") val num: Int,
+        @JsonProperty("title") val title: String? = null,
     )
 
     private fun toJson(data: EpisodeData): String? {
@@ -304,7 +355,7 @@ class MiruroProvider : MainAPI() {
         }
 
         if (m.format == "MOVIE") {
-            val dataJson = toJson(EpisodeData(id = id, num = 1)) ?: return null
+            val dataJson = toJson(EpisodeData(id = id, num = 1, title = title)) ?: return null
             return newMovieLoadResponse(title, url, TvType.AnimeMovie, dataJson) {
                 this.posterUrl = poster
                 this.plot = plot
@@ -326,7 +377,7 @@ class MiruroProvider : MainAPI() {
 
         val episodes = mutableListOf<Episode>()
         for (n in 1..epCount) {
-            val dataJson = toJson(EpisodeData(id = id, num = n)) ?: continue
+            val dataJson = toJson(EpisodeData(id = id, num = n, title = title)) ?: continue
             episodes.add(newEpisode(dataJson) {
                 this.name = "Episode $n"
                 this.episode = n
@@ -368,6 +419,269 @@ class MiruroProvider : MainAPI() {
             variants.sortByDescending { it.second }
             variants
         } catch (e: Exception) { emptyList() }
+    }
+
+    // ---- Anikoto fallback (only used when justanime returns nothing) ----
+
+    private fun akPageHeaders(referer: String? = null): Map<String, String> {
+        val h = mutableMapOf(
+            "User-Agent" to ua,
+            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        if (referer != null) h["Referer"] = referer
+        return h
+    }
+
+    private fun akAjaxHeaders(referer: String? = null): Map<String, String> {
+        val h = mutableMapOf(
+            "User-Agent" to ua,
+            "X-Requested-With" to "XMLHttpRequest",
+            "Accept" to "application/json, text/javascript, */*; q=0.01",
+        )
+        if (referer != null) h["Referer"] = referer
+        return h
+    }
+
+    /** AES-256-CBC decrypt of megaplay's getSources "enc" (base64url). */
+    private fun decryptMegaplay(enc: String): String? {
+        return try {
+            val ct = java.util.Base64.getUrlDecoder().decode(enc)
+            val keyBytes = megaKeyStr.toByteArray(Charsets.UTF_8).copyOf(32)
+            val ivBytes = megaIvStr.toByteArray(Charsets.UTF_8).copyOf(16)
+            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+            cipher.init(
+                Cipher.DECRYPT_MODE,
+                SecretKeySpec(keyBytes, "AES"),
+                IvParameterSpec(ivBytes),
+            )
+            String(cipher.doFinal(ct), Charsets.UTF_8)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** Normalize a title for matching (lowercase, strip punctuation). */
+    private fun normalizeTitle(raw: String): String {
+        return raw.lowercase()
+            .replace(Regex("[^a-z0-9]+"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    /** Resolve one megaplay embed URL to its master.m3u8 and emit variants. */
+    private suspend fun resolveAnikotoMegaplay(
+        embedUrl: String,
+        watchUrl: String,
+        tag: String,
+        callback: (ExtractorLink) -> Unit,
+        subtitleCallback: (SubtitleFile) -> Unit,
+    ): Boolean {
+        return try {
+            val embedHtml = app.get(embedUrl, headers = akPageHeaders(watchUrl)).text
+            val embedDoc = Jsoup.parse(embedHtml)
+            val player = embedDoc.selectFirst("#megaplay-player") ?: return false
+            val fileId = player.attr("data-id").trim()
+            val realId = player.attr("data-realid").trim()
+            // data-id first (full subtitle tracks); realid as fallback.
+            val ids = listOf(fileId, realId).filter { it.isNotEmpty() }.distinct()
+            for (id in ids) {
+                try {
+                    val gs = app.get(
+                        "https://megaplay.buzz/stream/getSourcesNew?id=$id",
+                        headers = akAjaxHeaders(embedUrl),
+                    ).parsed<AkGsResp>()
+                    val enc = gs.enc ?: continue
+                    val plain = decryptMegaplay(enc) ?: continue
+                    val master = tryParseJson<AkMegaFile>(plain)?.file?.trim() ?: continue
+                    if (master.isEmpty()) continue
+                    // Subtitles (best-effort: mysubsplay.com 403s from some networks).
+                    try {
+                        for (t in gs.tracks ?: emptyList()) {
+                            val kind = t.kind
+                            if (kind != null && kind != "captions" && kind != "subtitles") continue
+                            val file = t.file ?: t.src ?: t.url ?: continue
+                            subtitleCallback(SubtitleFile(t.label ?: "Unknown", file))
+                        }
+                    } catch (e: Exception) {
+                        // Subtitles must never kill the stream.
+                    }
+                    val variants = resolveMasterPlaylist(master, megaReferer)
+                    if (variants.isNotEmpty()) {
+                        var emitted = false
+                        for ((vUrl, vQ) in variants) {
+                            try {
+                                callback(
+                                    newExtractorLink(
+                                        source = "Miruro",
+                                        name = "Miruro MegaPlay [$tag]",
+                                        url = vUrl,
+                                        type = ExtractorLinkType.M3U8,
+                                    ) {
+                                        this.quality = vQ
+                                        this.referer = megaReferer
+                                        this.headers = mapOf(
+                                            "Referer" to megaReferer,
+                                            "User-Agent" to ua,
+                                        )
+                                    }
+                                )
+                                emitted = true
+                            } catch (e: Exception) { continue }
+                        }
+                        if (emitted) return true
+                    }
+                    // No variants (or none emitted): emit the master URL directly.
+                    try {
+                        callback(
+                            newExtractorLink(
+                                source = "Miruro",
+                                name = "Miruro MegaPlay [$tag]",
+                                url = master,
+                                type = ExtractorLinkType.M3U8,
+                            ) {
+                                this.quality = Qualities.Unknown.value
+                                this.referer = megaReferer
+                                this.headers = mapOf(
+                                    "Referer" to megaReferer,
+                                    "User-Agent" to ua,
+                                )
+                            }
+                        )
+                        return true
+                    } catch (e: Exception) {
+                        continue
+                    }
+                } catch (e: Exception) {
+                    continue
+                }
+            }
+            false
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /** Anikoto fallback: search anikoto.cz by title and resolve the episode
+     *  through its megaplay chain. Returns true if any stream was emitted. */
+    private suspend fun resolveAnikoto(
+        title: String,
+        num: Int,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        var found = false
+        try {
+            // 1. Search anikoto.cz by title.
+            val searchHtml = app.get(
+                "$anikotoUrl/filter?keyword=${URLEncoder.encode(title.trim(), "UTF-8")}",
+                headers = akPageHeaders(),
+            ).text
+            val searchDoc = Jsoup.parse(searchHtml)
+            val results = mutableListOf<Pair<String, String>>()
+            for (item in searchDoc.select("div#list-items div.item")) {
+                val posterA = item.selectFirst("div.ani.poster a[href]") ?: continue
+                var href = posterA.attr("href").trim()
+                if (href.isEmpty()) continue
+                href = href.substringBefore("/ep-")
+                val t = item.selectFirst("a.name.d-title")?.text()?.trim()
+                    ?: posterA.selectFirst("img")?.attr("alt")?.trim()
+                    ?: continue
+                if (t.isEmpty()) continue
+                results.add(t to href)
+            }
+            if (results.isEmpty()) return false
+            // Prefer a normalized exact match, then a contains match, else first.
+            val normQ = normalizeTitle(title)
+            val watchHref = results.firstOrNull { normalizeTitle(it.first) == normQ }?.second
+                ?: results.firstOrNull {
+                    val n = normalizeTitle(it.first)
+                    n.contains(normQ) || normQ.contains(n)
+                }?.second
+                ?: results.first().second
+            val watchUrl = if (watchHref.startsWith("http")) watchHref else anikotoUrl + watchHref
+
+            // 2. Watch page -> animeId.
+            val watchHtml = app.get(watchUrl, headers = akPageHeaders()).text
+            val watchDoc = Jsoup.parse(watchHtml)
+            val animeId = watchDoc.selectFirst("[data-anime-id]")?.attr("data-anime-id")?.trim()
+                .takeIf { !it.isNullOrEmpty() } ?: return false
+
+            // 3. Episode list -> data-ids token for this episode number.
+            val epResult = try {
+                app.get(
+                    "$anikotoUrl/ajax/episode/list/$animeId",
+                    headers = akAjaxHeaders(watchUrl),
+                ).parsed<AkAjaxResult>().result
+            } catch (e: Exception) {
+                null
+            } ?: return false
+            val epDoc = Jsoup.parse(epResult)
+            var ids: String? = null
+            for (a in epDoc.select("a[data-id][data-num][data-ids]")) {
+                if (a.attr("data-num").toIntOrNull() == num) {
+                    ids = a.attr("data-ids").trim().takeIf { it.isNotEmpty() }
+                    break
+                }
+            }
+            val token = ids ?: return false
+
+            // 4. Server list -> SUB first (prefer HD-1), else DUB.
+            val srvResult = try {
+                app.get(
+                    "$anikotoUrl/ajax/server/list?servers=${URLEncoder.encode(token, "UTF-8")}",
+                    headers = akAjaxHeaders(watchUrl),
+                ).parsed<AkAjaxResult>().result
+            } catch (e: Exception) {
+                null
+            } ?: return false
+            val srvDoc = Jsoup.parse(srvResult)
+            val servers = mutableListOf<AkServerEntry>()
+            for (typeDiv in srvDoc.select("div.type[data-type]")) {
+                val type = typeDiv.attr("data-type").trim().lowercase()
+                for (li in typeDiv.select("li[data-link-id]")) {
+                    val linkId = li.attr("data-link-id").trim()
+                    if (linkId.isEmpty()) continue
+                    servers.add(AkServerEntry(type, li.text().trim(), linkId))
+                }
+            }
+            if (servers.isEmpty()) return false
+
+            // 5. Server get -> megaplay embed -> resolve it. Try servers in
+            //    order (SUB first, HD-1 first within SUB) until one resolves.
+            val seenEmbeds = mutableSetOf<String>()
+            for (wantType in listOf("sub", "dub")) {
+                val typed = servers.filter { it.type == wantType }
+                val ordered = typed.sortedWith(
+                    compareByDescending<AkServerEntry> { it.name.contains("HD-1", ignoreCase = true) }
+                        .thenBy { typed.indexOf(it) }
+                )
+                for (server in ordered) {
+                    try {
+                        val got = app.get(
+                            "$anikotoUrl/ajax/server?get=${URLEncoder.encode(server.linkId, "UTF-8")}",
+                            headers = akAjaxHeaders(watchUrl),
+                        ).parsed<AkServerGetResp>()
+                        val embedUrl = got.result?.url?.trim() ?: continue
+                        if (!seenEmbeds.add(embedUrl)) continue
+                        val tag = if (wantType == "dub") "DUB" else "SUB"
+                        try {
+                            if (resolveAnikotoMegaplay(embedUrl, watchUrl, tag, callback, subtitleCallback)) {
+                                found = true
+                            }
+                        } catch (e: Exception) {
+                            // This server failed — try the next one.
+                        }
+                        if (found) break
+                    } catch (e: Exception) {
+                        continue
+                    }
+                }
+                if (found) break
+            }
+        } catch (e: Exception) {
+            // Fallback must never throw out of loadLinks.
+        }
+        return found
     }
 
     private suspend fun resolveProvider(
@@ -478,6 +792,18 @@ class MiruroProvider : MainAPI() {
                 if (resolveProvider(provider, ep.id, ep.num, callback, subtitleCallback)) found = true
             } catch (e: Exception) {
                 // Provider failed — move on to the next one.
+            }
+        }
+        // justanime unreachable (blocked on the user's network): fall back to
+        // the Anikoto megaplay chain, searched by the anime title.
+        if (!found) {
+            val t = ep.title?.trim().takeIf { !it.isNullOrBlank() }
+            if (t != null) {
+                try {
+                    if (resolveAnikoto(t, ep.num, subtitleCallback, callback)) found = true
+                } catch (e: Exception) {
+                    // Fallback failed — loadLinks must not throw.
+                }
             }
         }
         return found

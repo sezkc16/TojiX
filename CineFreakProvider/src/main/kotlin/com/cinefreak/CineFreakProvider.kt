@@ -330,11 +330,14 @@ class CineFreakProvider : MainAPI() {
         } catch (e: Exception) { return null }
         val n = nonce.n ?: return null
         // 2) unlock (empty Turnstile token works when enforcement is off)
+        // NOTE: form fields go in `data` (request body). `params` are
+        // URL query params — with params only, NiceHttp builds a POST
+        // with a null body and OkHttp throws before any request is sent.
         val unlock: UnlockResponse = try {
             app.post(
                 "https://cinecloud.top/f/$token/unlock",
                 headers = cineHeaders(token),
-                params = mapOf("ts" to "", "bc" to n)
+                data = mapOf("ts" to "", "bc" to n)
             ).parsed()
         } catch (e: Exception) { return null }
         if (unlock.ok != true) return null
@@ -368,7 +371,7 @@ class CineFreakProvider : MainAPI() {
             app.post(
                 "https://cinecloud.top/f/$token",
                 headers = cineHeaders(token),
-                params = mapOf("a" to "play")
+                data = mapOf("a" to "play")
             ).parsed()
         } catch (e: Exception) { return null }
         if (play.ok != true) return null

@@ -140,7 +140,7 @@ class HDHub4uProvider : MainAPI() {
             .replace(Regex(" \\| HDHub.*$"), "")
             .trim()
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-            ?: doc.selectFirst("div.entry-content img")?.attr("src")
+            ?: doc.selectFirst("div.post-content img, article img, .post img")?.attr("src")
         val isSeries = url.contains("-full-series/") || title.contains("Season", true)
 
         if (isSeries) {
@@ -148,7 +148,9 @@ class HDHub4uProvider : MainAPI() {
             // Per-episode: "EPiSODE N" heading, then a 720p and a 1080p
             // hubdrive link. Walk the links in document order, tracking the
             // current episode number from the surrounding headings.
-            val bodyHtml = doc.selectFirst("div.entry-content")?.html() ?: html
+            // (Note: this theme does NOT use a div.entry-content container,
+            // so parse the whole page body.)
+            val bodyHtml = doc.body()?.html() ?: html
             // Split the content on "EPiSODE N" markers
             val epSplit = Regex("(?i)EPiSODE\\s*(\\d+)").findAll(bodyHtml).toList()
             for ((idx, m) in epSplit.withIndex()) {
@@ -199,9 +201,11 @@ class HDHub4uProvider : MainAPI() {
         } else {
             // Movie: collect quality download links (hubcdn + hubdrive).
             // greenmotors links are NOT resolvable, so they are skipped.
+            // (Note: this theme does NOT use a div.entry-content container,
+            // so scan all links in the page.)
             val hubcdn = mutableMapOf<String, String>()
             val hubdrive = mutableMapOf<String, String>()
-            for (a in doc.select("div.entry-content a[href]")) {
+            for (a in doc.select("a[href]")) {
                 val href = a.attr("href")
                 val txt = a.text().trim()
                 if (txt.isEmpty()) continue

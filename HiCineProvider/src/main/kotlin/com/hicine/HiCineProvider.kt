@@ -297,6 +297,7 @@ class HiCineProvider : MainAPI() {
                         this.name = "Episode $epNum"
                         this.episode = epNum
                         this.season = seasonNum
+                        this.posterUrl = poster
                     })
                 }
             }

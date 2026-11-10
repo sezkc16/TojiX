@@ -559,6 +559,87 @@ class MultiMoviesProvider : MainAPI() {
         }
     }
 
+    // v5: Modiplay's StreamHG / Bingr player pages (proxy.php?p=<platform>).
+    // These pages are NOT packed JS (no eval(function(p,a,c,k...)) — the
+    // EarnVids packer finds nothing. Instead the player page bakes the
+    // stream into `var src=".../stream_proxy.php?url=<urlencoded master.m3u8>&ref=...&tok=..."`
+    // (verify: that proxy URL returns 200 + valid HLS 480p/720p/1080p with
+    // Hindi+English audio; the `directSrc` vibuxer.com master 403s, so it
+    // must NOT be used) and subtitles into `SUBTITLES = [{url, label, lang}]`
+    // (each url is an /api/sub_proxy.php?url=... with its own tok).
+    // The token + expiry are per-embed, so they are read from the page
+    // every time, never hardcoded.
+    private suspend fun resolveProxyPhp(
+        proxyUrl: String,
+        label: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+        referer: String,
+    ): Boolean {
+        return try {
+            val resp = try {
+                app.get(proxyUrl, headers = browserHeaders + mapOf("Referer" to referer))
+            } catch (e: Exception) {
+                return false
+            }
+            val html = resp.text
+            val base = originOf(resp.url)
+            if (base.isBlank()) return false
+            // 1) Stream URL: var src=".../stream_proxy.php?url=...master.m3u8&ref=...&tok=..."
+            val srcMatch = Regex(
+                "var src\\s*=\\s*\"([^\"]+stream_proxy\\.php\\?url=[^\"]+)\""
+            ).find(html)
+            val src = srcMatch?.groupValues?.getOrNull(1)
+                ?.let { deEsc(it) }?.takeIf { it.isNotBlank() } ?: return false
+            val master = if (src.startsWith("http")) src else absUrl(base, src)
+            var found = false
+            // 2) Subtitles: SUBTITLES = [{"url":"...","label":"ENG","lang":"en"}]
+            try {
+                val subsJson = Regex(
+                    "SUBTITLES\\s*=\\s*(\\[[^\\]]*\\])"
+                ).find(html)?.groupValues?.getOrNull(1)
+                if (subsJson != null) {
+                    val seen = mutableSetOf<String>()
+                    for (obj in Regex("\\{[^}]*\"url\"\\s*:\\s*\"[^\"]+\"[^}]*\\}").findAll(subsJson)) {
+                        val u = Regex(
+                            "\"url\"\\s*:\\s*\"([^\"]+)\""
+                        ).find(obj.value)?.groupValues?.getOrNull(1)
+                            ?.let { deEsc(it) }?.takeIf { it.isNotBlank() } ?: continue
+                        val abs = if (u.startsWith("http")) u else absUrl(base, u)
+                        if (!seen.add(abs)) continue
+                        val lang = Regex(
+                            "\"lang\"\\s*:\\s*\"([^\"]+)\""
+                        ).find(obj.value)?.groupValues?.getOrNull(1)
+                            ?.takeIf { it.isNotBlank() }?.uppercase()
+                            ?: Regex(
+                                "\"label\"\\s*:\\s*\"([^\"]+)\""
+                            ).find(obj.value)?.groupValues?.getOrNull(1)
+                                ?.takeIf { it.isNotBlank() }?.uppercase()
+                            ?: "Subtitle"
+                        try {
+                            subtitleCallback(SubtitleFile(lang, abs))
+                        } catch (e: Exception) {
+                            // one bad subtitle must not kill the stream
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                // subtitles are optional
+            }
+            // 3) Expand the master into per-variant links. Referer is the
+            // proxy page itself (verified working); the variant URIs are
+            // relative stream_proxy.php URLs resolved against the master.
+            try {
+                if (expandMaster(master, label, resp.url, callback)) found = true
+            } catch (e: Exception) {
+                // fall through
+            }
+            found
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     // Modiplay (Cineverse) embed: https://<host>.modiplay.xyz/embed/tmdb/...
     // The page lists its sub-servers as <div class="srv-item">
     // data-url / data-platform / data-pname / data-code. Each sub-embed
@@ -590,8 +671,28 @@ class MultiMoviesProvider : MainAPI() {
                 val subEmbed = srv[0].trim()
                 val subLabel = srv[2].trim().takeIf { it.isNotBlank() } ?: label
                 if (subEmbed.isBlank()) continue
-                // Filemoon gives only a code (not a URL) and Bingr a
-                // relative proxy.php — the packer cannot fetch those.
+                // v5: a proxy.php URL (Bingr, and any StreamHG proxy) is a
+                // StreamHG player page, not a packed-JS embed — the packer
+                // finds nothing there. Resolve it via the stream_proxy.php
+                // var src. This is the path that fixes Other Mommy (vidout
+                // 404s for it, and its EarnVids hls2 is ASN-bound 403).
+                if (subEmbed.contains("proxy.php")) {
+                    val abs = if (subEmbed.startsWith("http")) {
+                        deEsc(subEmbed)
+                    } else {
+                        absUrl(originOf(embedUrl), deEsc(subEmbed))
+                    }
+                    try {
+                        if (resolveProxyPhp(abs, subLabel, subtitleCallback, callback, embedUrl)) {
+                            found = true
+                        }
+                    } catch (e: Exception) {
+                        // one dead sub-server must not kill the rest
+                    }
+                    continue
+                }
+                // Filemoon gives only a code (not a URL) — the packer
+                // cannot fetch it.
                 if (!subEmbed.startsWith("http")) continue
                 try {
                     if (resolvePackerEmbed(subEmbed, subLabel, subtitleCallback, callback, embedUrl)) {
@@ -600,6 +701,34 @@ class MultiMoviesProvider : MainAPI() {
                 } catch (e: Exception) {
                     // one dead sub-server must not kill the rest
                 }
+            }
+            // v5: the active StreamHG player is also loaded through an
+            // <iframe id="playerFrame" src="/proxy.php?p=streamhg&c=...">
+            // which is NOT in the srv-item list — follow it too. (For TV
+            // embeds the same iframe carries the episode's streamhg code.)
+            try {
+                val seenProxy = mutableSetOf<String>()
+                for (m in Regex(
+                    "<iframe[^>]*src=\"([^\"]*proxy\\.php[^\"]*)\""
+                ).findAll(html)) {
+                    val raw = deEsc(m.groupValues[1]).trim()
+                    if (raw.isBlank()) continue
+                    val abs = if (raw.startsWith("http")) {
+                        raw
+                    } else {
+                        absUrl(originOf(embedUrl), raw)
+                    }
+                    if (!seenProxy.add(abs)) continue
+                    try {
+                        if (resolveProxyPhp(abs, label, subtitleCallback, callback, embedUrl)) {
+                            found = true
+                        }
+                    } catch (e: Exception) {
+                        // one dead iframe must not kill the rest
+                    }
+                }
+            } catch (e: Exception) {
+                // iframe parsing is best effort
             }
             found
         } catch (e: Exception) {

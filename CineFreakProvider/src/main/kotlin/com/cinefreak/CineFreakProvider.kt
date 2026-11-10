@@ -392,7 +392,7 @@ class CineFreakProvider : MainAPI() {
         // quality whose watch token still works.
         val groups = (ep.links ?: emptyList()).groupBy { it.label }
 
-        fun emit(label: String, quality: Int, url: String): Boolean {
+        suspend fun emit(label: String, quality: Int, url: String): Boolean {
             if (!seenUrls.add(url)) return false
             callback(
                 newExtractorLink(
@@ -439,8 +439,9 @@ class CineFreakProvider : MainAPI() {
 
         // Pass 2 (only if pass 1 found NOTHING — e.g. a short
         // Turnstile enforcement blip): wait, then resolve every group
-        // again with fresh nonces.
-        kotlinx.coroutines.delay(5000)
+        // again with fresh nonces. Thread.sleep, not coroutines delay:
+        // kotlinx-coroutines is not on this module's compile classpath.
+        Thread.sleep(5000)
         for ((label, entries) in groups) {
             if (resolveGroup(label, entries)) found = true
         }

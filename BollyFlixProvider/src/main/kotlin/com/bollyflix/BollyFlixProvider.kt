@@ -189,7 +189,7 @@ class BollyFlixProvider : MainAPI() {
     // with TWO <a class="dl"> buttons: dl.fastdlserver.site/?id=<b64>
     // &type=file ("Google Drive") and linksmod.top/view/<id>
     // ("Download Links"). One LinkEntry per (quality, host).
-    private fun loadMovie(title: String, url: String, doc: org.jsoup.nodes.Document, poster: String?): LoadResponse? {
+    private suspend fun loadMovie(title: String, url: String, doc: org.jsoup.nodes.Document, poster: String?): LoadResponse? {
         val links = mutableListOf<LinkEntry>()
         for (h5 in doc.select("h5")) {
             val heading = cleanText(h5.text())

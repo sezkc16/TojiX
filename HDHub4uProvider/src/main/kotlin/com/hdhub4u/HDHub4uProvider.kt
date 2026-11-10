@@ -1,6 +1,6 @@
 package com.hdhub4u
 
-import android.util.Base64
+import java.util.Base64 as JavaBase64
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.Episode
 import com.lagradost.cloudstream3.HomePageList
@@ -236,7 +236,7 @@ class HDHub4uProvider : MainAPI() {
     private fun b64decode(input: String): String? {
         return try {
             val padded = input + "=".repeat((4 - input.length % 4) % 4)
-            String(Base64.decode(padded, Base64.DEFAULT), Charsets.UTF_8)
+            String(JavaBase64.getDecoder().decode(padded), Charsets.UTF_8)
         } catch (e: Exception) { null }
     }
 

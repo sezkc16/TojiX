@@ -270,7 +270,7 @@ class VegamoviesProvider : MainAPI() {
         } catch (e: Exception) { return emptyList() }
         return Regex("""-:Episodes:\s*(\d+):-""").findAll(html)
             .mapNotNull { it.groupValues[1].toIntOrNull() }
-            .distinct().sorted()
+            .distinct().sorted().toList()
     }
 
     // Resolve one nexdrive link (optionally a single episode inside it)
@@ -281,7 +281,7 @@ class VegamoviesProvider : MainAPI() {
         } catch (e: Exception) { return null }
         // Pick the G-Direct fast-dl link: for an episode, the one inside
         // that episode's section; otherwise the first one on the page.
-        val fastDlUrl: String? = if (ep != null) {
+        val fastDlUrl = if (ep != null) {
             val markers = Regex("""-:Episodes:\s*(\d+):-""").findAll(nexHtml).toList()
             var found: String? = null
             for ((idx, mk) in markers.withIndex()) {

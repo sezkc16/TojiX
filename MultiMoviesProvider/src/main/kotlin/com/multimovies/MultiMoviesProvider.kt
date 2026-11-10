@@ -89,6 +89,40 @@ class MultiMoviesProvider : MainAPI() {
         @JsonProperty("subtitles") val subtitles: List<Map<String, Any?>>? = null,
     )
 
+    // VidBolt /api/resolve response: {stream: {server, sources: [{url,
+    // kind, quality, language}], subtitles: [{url, label, lang}]}}.
+    // stream is null when the title has no VidBolt entry (e.g. hevc=0
+    // for The Good Lawyer). Sources live on two host families:
+    // proxy.vidbolt.xyz/m/<token> (h264, media or master playlist) and
+    // dash-hls-bridge.johndoesdmc.workers.dev (HEVC callisto, master
+    // playlist) — both verified 200 + valid HLS from this VM.
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class VidBoltSource(
+        @JsonProperty("url") val url: String? = null,
+        @JsonProperty("kind") val kind: String? = null,
+        @JsonProperty("quality") val quality: String? = null,
+        @JsonProperty("language") val language: String? = null,
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class VidBoltSubtitle(
+        @JsonProperty("url") val url: String? = null,
+        @JsonProperty("label") val label: String? = null,
+        @JsonProperty("lang") val lang: String? = null,
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class VidBoltStream(
+        @JsonProperty("server") val server: String? = null,
+        @JsonProperty("sources") val sources: List<VidBoltSource>? = null,
+        @JsonProperty("subtitles") val subtitles: List<VidBoltSubtitle>? = null,
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class VidBoltResolveResponse(
+        @JsonProperty("stream") val stream: VidBoltStream? = null,
+    )
+
     // ---- Helpers ----
 
     private fun toJson(data: LinkData): String? {
@@ -300,6 +334,17 @@ class MultiMoviesProvider : MainAPI() {
             try {
                 val host = hostOf(u)
                 when {
+                    // v6: VidBolt FIRST for movies — it is the only path
+                    // that does not depend on modiplay / vidhide / vidout
+                    // / Vidrift / Filmu, all of which are unreachable
+                    // from the user's phone. TV resolve 400s, so TV
+                    // skips VidBolt and keeps the StreamHG/EarnVids
+                    // paths below.
+                    host.contains("vidbolt") -> {
+                        if (!isTv) {
+                            if (resolveVidBolt(u, label, subtitleCallback, callback)) found = true
+                        }
+                    }
                     host.contains("modiplay") -> {
                         if (resolveModiplay(u, label, subtitleCallback, callback)) found = true
                     }
@@ -322,6 +367,7 @@ class MultiMoviesProvider : MainAPI() {
         for ((u, label) in servers) {
             val host = hostOf(u)
             if (host.contains("modiplay") || host.contains("vidout") ||
+                host.contains("vidbolt") ||
                 u.contains("vidrift.net") || u.contains("filmu.in") || u.contains("vidly.pro")
             ) continue
             try {
@@ -810,6 +856,94 @@ class MultiMoviesProvider : MainAPI() {
         } catch (e: Exception) {
             false
         }
+    }
+
+    // v6: VidBolt — an INDEPENDENT host family (vidbolt.xyz +
+    // proxy.vidbolt.xyz + the dash-hls-bridge worker). v5 still showed
+    // "No streams found" on the user's phone even after a clean
+    // uninstall + reinstall, so modiplay (incl. StreamHG), vidhide,
+    // Vidrift, Filmu and vidout are all unreachable from his phone.
+    // VidBolt does not depend on any of them.
+    // GET https://vidbolt.xyz/api/resolve?type=movie&id=<tmdbId>
+    // (Referer = the vidbolt page) returns {stream: {server, sources:
+    // [{url, kind, quality, language}], subtitles: [{url, label,
+    // lang}]}}. The page's own JS appends &hevc=0 ONLY when the client
+    // cannot play HEVC — so we try WITHOUT hevc first (iPhone plays
+    // HEVC), then WITH hevc=0 as a fallback, and merge both (dedup by
+    // URL): for Viruman the no-hevc call gives callisto/Tamil only and
+    // hevc=0 adds the Hindi source; for The Good Lawyer hevc=0 returns
+    // {"stream":null} and only the no-hevc call works. Movies only —
+    // the TV resolve 400s, so TV embeds never reach this function (the
+    // /movie/<id> regex below also rejects them).
+    private suspend fun resolveVidBolt(
+        embedUrl: String,
+        label: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        val tmdbId = Regex("""/movie/(\d+)""", RegexOption.IGNORE_CASE)
+            .find(embedUrl)?.groupValues?.getOrNull(1)?.takeIf { it.isNotBlank() }
+            ?: return false
+        val referer = embedUrl
+        val seenUrls = mutableSetOf<String>()
+        var found = false
+        // Try both variants: no-hevc (HEVC-capable client) first, then
+        // hevc=0 (h264). Merge — each can return sources the other lacks.
+        val queries = listOf(
+            "type=movie&id=$tmdbId",
+            "type=movie&id=$tmdbId&hevc=0",
+        )
+        for (q in queries) {
+            val parsed = try {
+                val body = app.get(
+                    "https://vidbolt.xyz/api/resolve?$q",
+                    headers = browserHeaders + mapOf("Referer" to referer),
+                ).text
+                tryParseJson<VidBoltResolveResponse>(body)
+            } catch (e: Exception) {
+                null
+            } ?: continue
+            val stream = parsed.stream ?: continue
+            // Subtitles (best effort, dedup by URL).
+            try {
+                val seenSubs = mutableSetOf<String>()
+                for (sub in stream.subtitles.orEmpty()) {
+                    val u = sub.url?.takeIf { it.isNotBlank() } ?: continue
+                    if (!seenSubs.add(u)) continue
+                    val lang = sub.lang?.takeIf { it.isNotBlank() }
+                        ?: sub.label?.takeIf { it.isNotBlank() }
+                        ?: "Subtitle"
+                    try {
+                        subtitleCallback(SubtitleFile(lang, u))
+                    } catch (e: Exception) {
+                        // one bad subtitle must not kill the streams
+                    }
+                }
+            } catch (e: Exception) {
+                // subtitles are optional
+            }
+            for (src in stream.sources.orEmpty()) {
+                val url = src.url?.takeIf { it.isNotBlank() } ?: continue
+                if (!seenUrls.add(url)) continue
+                val qLabel = src.quality?.trim()?.takeIf { it.isNotBlank() }
+                val langLabel = src.language?.trim()?.takeIf { it.isNotBlank() }
+                val name = buildString {
+                    append("VidBolt")
+                    if (qLabel != null) append(" $qLabel")
+                    if (langLabel != null) append(" $langLabel")
+                }
+                try {
+                    // Sources are master playlists (callisto bridge,
+                    // Other Mommy proxy) or media playlists (Viruman
+                    // proxy) — expandMaster handles both, and carries the
+                    // vidbolt page as Referer (verified 200 for both).
+                    if (expandMaster(url, name, referer, callback)) found = true
+                } catch (e: Exception) {
+                    // one dead source must not kill the rest
+                }
+            }
+        }
+        return found
     }
 
     // Last-resort fallback: scrape direct .m3u8 / .mp4 URLs out of an

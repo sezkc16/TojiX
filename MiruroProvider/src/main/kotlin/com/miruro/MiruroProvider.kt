@@ -390,18 +390,24 @@ class MiruroProvider : MainAPI() {
             val tag = audio.uppercase()
 
             // Subtitles (captions/subtitles only — skip "thumbnails" tracks).
-            val tracks = typeData.subtitles ?: typeData.tracks ?: emptyList()
-            var hasDefault = false
-            for (t in tracks) {
-                val kind = t.kind
-                if (kind != null && kind != "captions" && kind != "subtitles") continue
-                val file = t.file ?: t.src ?: t.url ?: continue
-                val label = t.label ?: "Unknown"
-                val isDefault = t.default == true || t.isDefault == true
-                if (isDefault) hasDefault = true
-                subtitleCallback(SubtitleFile(label, file))
+            // Wrapped in try/catch: a subtitleCallback failure must never kill
+            // stream emission (subtitles are best-effort).
+            try {
+                val tracks = typeData.subtitles ?: typeData.tracks ?: emptyList()
+                var hasDefault = false
+                for (t in tracks) {
+                    val kind = t.kind
+                    if (kind != null && kind != "captions" && kind != "subtitles") continue
+                    val file = t.file ?: t.src ?: t.url ?: continue
+                    val label = t.label ?: "Unknown"
+                    val isDefault = t.default == true || t.isDefault == true
+                    if (isDefault) hasDefault = true
+                    subtitleCallback(SubtitleFile(label, file))
+                }
+                // (CloudStream picks a default track itself; no marking needed.)
+            } catch (e: Exception) {
+                // Skip subtitles and keep emitting streams.
             }
-            // (CloudStream picks a default track itself; no marking needed.)
 
             val typeHeaders = typeData.headers ?: emptyMap()
             for (s in typeData.sources ?: emptyList()) {
@@ -416,36 +422,40 @@ class MiruroProvider : MainAPI() {
                     val variants = resolveMasterPlaylist(streamUrl, referer)
                     if (variants.isNotEmpty()) {
                         for ((vUrl, vQ) in variants) {
-                            callback(
-                                newExtractorLink(
-                                    source = "Miruro",
-                                    name = "MegaPlay [$tag]",
-                                    url = vUrl,
-                                    type = ExtractorLinkType.M3U8
-                                ) {
-                                    this.quality = vQ
-                                    this.referer = referer
-                                    this.headers = headers
-                                }
-                            )
+                            try {
+                                callback(
+                                    newExtractorLink(
+                                        source = "Miruro",
+                                        name = "MegaPlay [$tag]",
+                                        url = vUrl,
+                                        type = ExtractorLinkType.M3U8
+                                    ) {
+                                        this.quality = vQ
+                                        this.referer = referer
+                                        this.headers = headers
+                                    }
+                                )
+                            } catch (e: Exception) { continue }
                             found = true
                         }
                         continue
                     }
                 }
                 val q = qualityFromLabel(s.quality)
-                callback(
-                    newExtractorLink(
-                        source = "Miruro",
-                        name = if (provider == "megaplay") "MegaPlay [$tag]" else "AnimeGG [$tag]",
-                        url = streamUrl,
-                        type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                    ) {
-                        this.quality = q
-                        this.referer = referer
-                        this.headers = headers
-                    }
-                )
+                try {
+                    callback(
+                        newExtractorLink(
+                            source = "Miruro",
+                            name = if (provider == "megaplay") "MegaPlay [$tag]" else "AnimeGG [$tag]",
+                            url = streamUrl,
+                            type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        ) {
+                            this.quality = q
+                            this.referer = referer
+                            this.headers = headers
+                        }
+                    )
+                } catch (e: Exception) { continue }
                 found = true
             }
         }
@@ -461,8 +471,14 @@ class MiruroProvider : MainAPI() {
         val ep = tryParseJson<EpisodeData>(data) ?: return false
         var found = false
         // megaplay first (HLS, usually 1080p), animegg second (MP4 alternates).
+        // Each provider is isolated: one provider's exception must never kill
+        // the other provider or propagate out of loadLinks.
         for (provider in listOf("megaplay", "animegg")) {
-            if (resolveProvider(provider, ep.id, ep.num, callback, subtitleCallback)) found = true
+            try {
+                if (resolveProvider(provider, ep.id, ep.num, callback, subtitleCallback)) found = true
+            } catch (e: Exception) {
+                // Provider failed — move on to the next one.
+            }
         }
         return found
     }

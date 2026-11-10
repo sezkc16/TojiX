@@ -166,8 +166,6 @@ class FourKHDHubProvider : MainAPI() {
             .firstOrNull { it.length >= 100 }
         val tags = doc.select("span.badge").map { cleanTitle(it.text()) }
             .filter { it.isNotEmpty() }.distinct().take(8)
-        val trailer = doc.selectFirst("#trailer-btn")?.attr("data-trailer-url")
-            ?.takeIf { it.isNotEmpty() }
         val isSeries = url.contains("-series-")
 
         if (isSeries) {
@@ -260,9 +258,6 @@ class FourKHDHubProvider : MainAPI() {
                 this.plot = plot
                 this.year = year
                 this.tags = tags
-                if (trailer != null) {
-                    com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer(trailer)
-                }
             }
         } else {
             // Movie: one link entry per quality download-item (label keeps
@@ -295,9 +290,6 @@ class FourKHDHubProvider : MainAPI() {
                 this.plot = plot
                 this.year = year
                 this.tags = tags
-                if (trailer != null) {
-                    com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer(trailer)
-                }
             }
         }
     }

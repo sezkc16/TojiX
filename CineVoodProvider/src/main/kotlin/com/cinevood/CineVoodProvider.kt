@@ -292,7 +292,7 @@ class CineVoodProvider : MainAPI() {
                     found = true
                 }
                 "filepress", "gdflix", "vidara" -> {
-                    if (loadExtractor(entry.id, entry.id, subtitleCallback, callback)) {
+                    if (loadExtractor(entry.id, subtitleCallback, callback)) {
                         found = true
                     }
                 }

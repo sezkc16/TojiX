@@ -1,5 +1,5 @@
 // Use an integer for version numbers
-version = 12
+version = 13
 
 cloudstream {
     description = "Watch K-Dramas, C-Dramas and Hindi Dubbed series from KatDrama"
@@ -15,11 +15,7 @@ cloudstream {
     status = 1
 
     tvTypes = listOf("TvSeries")
-    iconUrl = "https://new2.katdrama.my/wp-content/uploads/2025/11/logo-2-1.png"
+    iconUrl = "https://catimages.org/images/2026/05/05/cropped-KATDRAMA-fab.png"
 
     isCrossPlatform = true
-}
-
-android {
-    namespace = "com.katdrama"
 }

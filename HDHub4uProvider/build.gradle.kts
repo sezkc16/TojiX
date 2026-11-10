@@ -1,5 +1,5 @@
 // Use an integer for version numbers
-version = 3
+version = 4
 
 cloudstream {
     description = "Download HD Movies & TV Shows from HDHub4u"
@@ -15,7 +15,7 @@ cloudstream {
     status = 1
 
     tvTypes = listOf("Movie", "TvSeries")
-    iconUrl = "https://new12.hdhub4u.cl/wp-content/uploads/2024/10/hdhub4u.png"
+    iconUrl = "https://new12.hdhub4u.cl/wp-content/uploads/2021/05/cropped-cropped-1-1-1-2-1-192x192.png"
 
     isCrossPlatform = true
 }

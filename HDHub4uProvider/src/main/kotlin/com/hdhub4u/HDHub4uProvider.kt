@@ -41,12 +41,19 @@ class HDHub4uProvider : MainAPI() {
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
 
-    // Episode data passed to loadLinks (as JSON string)
-    // hubcdn: quality label -> hubcdn file id (resolves to direct R2 file)
-    // hubdrive: quality label -> hubdrive file id (resolves via HubCloud)
+    // Episode data passed to loadLinks (as JSON string).
+    // A LIST of links (not a map) so every quality variant shows
+    // separately with its size, e.g. "1080p x264 [4.6GB]" and
+    // "HQ 1080p (SOURCE) [32.8GB]" are two different entries.
+    data class LinkEntry(
+        @JsonProperty("label") val label: String,  // full button text, e.g. "HQ 1080p (SOURCE) [32.8GB]"
+        @JsonProperty("host") val host: String,    // "hubcdn" or "hubdrive"
+        @JsonProperty("id") val id: String,        // file id
+        @JsonProperty("q") val quality: Int,       // Qualities value
+    )
+
     data class EpisodeData(
-        @JsonProperty("hubcdn") val hubcdn: Map<String, String>? = null,
-        @JsonProperty("hubdrive") val hubdrive: Map<String, String>? = null,
+        @JsonProperty("links") val links: List<LinkEntry>? = null,
     )
 
     private fun qualityValue(label: String): Int {
@@ -158,14 +165,17 @@ class HDHub4uProvider : MainAPI() {
                 val segStart = m.range.last
                 val segEnd = if (idx + 1 < epSplit.size) epSplit[idx + 1].range.first else bodyHtml.length
                 val seg = bodyHtml.substring(segStart, segEnd)
-                val hub = mutableMapOf<String, String>()
+                val links = mutableListOf<LinkEntry>()
+                val seenIds = mutableSetOf<String>()
                 for (lm in Regex("https://hubdrive\\.blog/file/(\\d+)").findAll(seg)) {
+                    val id = lm.groupValues[1]
+                    if (!seenIds.add(id)) continue
                     // The 720p link comes first, 1080p second in each segment
-                    val q = if (hub.containsKey("720p")) "1080p" else "720p"
-                    hub[q] = lm.groupValues[1]
+                    val label = if (links.isEmpty()) "720p" else "1080p"
+                    links.add(LinkEntry(label, "hubdrive", id, qualityValue(label)))
                 }
-                if (hub.isEmpty()) continue
-                val dataJson = toJson(EpisodeData(hubdrive = hub)) ?: continue
+                if (links.isEmpty()) continue
+                val dataJson = toJson(EpisodeData(links = links)) ?: continue
                 episodes.add(newEpisode(dataJson) {
                     this.name = "Episode $epNum"
                     this.episode = epNum
@@ -176,7 +186,7 @@ class HDHub4uProvider : MainAPI() {
                 .map { it.groupValues[1] }.distinct().toList()
             val usedIds = episodes.flatMap { ep ->
                 val d = tryParseJson<EpisodeData>(ep.data) ?: return@flatMap emptyList<String>()
-                (d.hubdrive?.values ?: emptyList())
+                (d.links?.map { it.id } ?: emptyList())
             }.toSet()
             for (pid in packLinks) {
                 if (pid in usedIds) continue
@@ -184,14 +194,14 @@ class HDHub4uProvider : MainAPI() {
                 val pos = bodyHtml.indexOf(pid)
                 val ctx = if (pos >= 0) bodyHtml.substring(maxOf(0, pos - 120), minOf(bodyHtml.length, pos + 40)) else ""
                 if (!ctx.contains("PACK", true)) continue
-                val q = when {
-                    ctx.contains("2160", true) || ctx.contains("4K", true) -> "2160p"
-                    ctx.contains("1080", true) -> "1080p"
+                val label = when {
+                    ctx.contains("2160", true) || ctx.contains("4K", true) -> "2160p Pack"
+                    ctx.contains("1080", true) -> "1080p Pack"
                     else -> "Pack"
                 }
-                val dataJson = toJson(EpisodeData(hubdrive = mapOf(q to pid))) ?: continue
+                val dataJson = toJson(EpisodeData(links = listOf(LinkEntry(label, "hubdrive", pid, qualityValue(label))))) ?: continue
                 episodes.add(newEpisode(dataJson) {
-                    this.name = "Season Pack ($q)"
+                    this.name = "Season Pack ($label)"
                 })
             }
             if (episodes.isEmpty()) return null
@@ -199,36 +209,36 @@ class HDHub4uProvider : MainAPI() {
                 this.posterUrl = poster
             }
         } else {
-            // Movie: collect quality download links (hubcdn + hubdrive).
+            // Movie: collect EVERY quality download link (hubcdn + hubdrive),
+            // keeping the full button text (with size) so the user can pick
+            // the highest, e.g. "HQ 1080p (SOURCE) [32.8GB]".
             // greenmotors links are NOT resolvable, so they are skipped.
             // (Note: this theme does NOT use a div.entry-content container,
             // so scan all links in the page.)
-            val hubcdn = mutableMapOf<String, String>()
-            val hubdrive = mutableMapOf<String, String>()
+            val links = mutableListOf<LinkEntry>()
+            val seenIds = mutableSetOf<String>()
             for (a in doc.select("a[href]")) {
                 val href = a.attr("href")
-                val txt = a.text().trim()
+                val txt = cleanTitle(a.text())
                 if (txt.isEmpty()) continue
-                val q = when {
-                    txt.contains("2160", true) || txt.contains("4K", true) -> "2160p"
-                    txt.contains("1080", true) -> "1080p"
-                    txt.contains("720", true) -> "720p"
-                    txt.contains("480", true) -> "480p"
-                    else -> continue
-                }
+                if (!txt.contains("480") && !txt.contains("720") && !txt.contains("1080") && !txt.contains("2160") && !txt.contains("4K", true)) continue
                 when {
                     href.contains("hubcdn.club/file/") -> {
                         val id = href.substringAfter("hubcdn.club/file/").substringBefore("/").substringBefore("?").trim()
-                        if (id.isNotEmpty() && !hubcdn.containsKey(q)) hubcdn[q] = id
+                        if (id.isNotEmpty() && seenIds.add("cdn:$id")) {
+                            links.add(LinkEntry(txt, "hubcdn", id, qualityValue(txt)))
+                        }
                     }
                     href.contains("hubdrive.blog/file/") -> {
                         val id = href.substringAfter("hubdrive.blog/file/").substringBefore("/").substringBefore("?").trim()
-                        if (id.isNotEmpty() && !hubdrive.containsKey(q)) hubdrive[q] = id
+                        if (id.isNotEmpty() && seenIds.add("drive:$id")) {
+                            links.add(LinkEntry(txt, "hubdrive", id, qualityValue(txt)))
+                        }
                     }
                 }
             }
-            if (hubcdn.isEmpty() && hubdrive.isEmpty()) return null
-            val dataJson = toJson(EpisodeData(hubcdn = hubcdn.ifEmpty { null }, hubdrive = hubdrive.ifEmpty { null })) ?: return null
+            if (links.isEmpty()) return null
+            val dataJson = toJson(EpisodeData(links = links)) ?: return null
             return newMovieLoadResponse(title, url, TvType.Movie, dataJson) {
                 this.posterUrl = poster
             }
@@ -309,35 +319,26 @@ class HDHub4uProvider : MainAPI() {
         val ep = tryParseJson<EpisodeData>(data) ?: return false
         var found = false
 
-        // hubcdn -> direct R2 file
-        ep.hubcdn?.forEach { (label, fileId) ->
-            val direct = resolveHubCdn(fileId) ?: return@forEach
+        // Resolve every link entry; the source name keeps the full button
+        // text (with size) so the user can pick the highest, e.g.
+        // "HubCloud HQ 1080p (SOURCE) [32.8GB]".
+        ep.links?.forEach { entry ->
+            val direct = when (entry.host) {
+                "hubcdn" -> resolveHubCdn(entry.id)
+                "hubdrive" -> resolveHubDrive(entry.id)
+                else -> null
+            } ?: return@forEach
+            val source = if (entry.host == "hubcdn") "HubCdn" else "HubCloud"
+            val referer = if (entry.host == "hubcdn") "https://hubcdn.club/" else "https://hubcloud.pw/"
             callback(
                 newExtractorLink(
-                    source = "HubCdn",
-                    name = "HubCdn $label",
+                    source = source,
+                    name = "$source ${entry.label}",
                     url = direct,
                     type = ExtractorLinkType.VIDEO
                 ) {
-                    this.quality = qualityValue(label)
-                    this.referer = "https://hubcdn.club/"
-                }
-            )
-            found = true
-        }
-
-        // hubdrive -> HubCloud direct file
-        ep.hubdrive?.forEach { (label, fileId) ->
-            val direct = resolveHubDrive(fileId) ?: return@forEach
-            callback(
-                newExtractorLink(
-                    source = "HubCloud",
-                    name = "HubCloud $label",
-                    url = direct,
-                    type = ExtractorLinkType.VIDEO
-                ) {
-                    this.quality = qualityValue(label)
-                    this.referer = "https://hubcloud.pw/"
+                    this.quality = entry.quality
+                    this.referer = referer
                 }
             )
             found = true

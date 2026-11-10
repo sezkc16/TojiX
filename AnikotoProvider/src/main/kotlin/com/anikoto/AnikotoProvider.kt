@@ -29,10 +29,13 @@ import com.lagradost.cloudstream3.toNewSearchResponseList
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import java.net.URL
 import java.net.URLEncoder
 import javax.crypto.Cipher
+import javax.crypto.Mac
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import org.json.JSONObject
@@ -44,20 +47,28 @@ import org.jsoup.Jsoup
  * Server-rendered AniWatch-clone theme. Catalogue pages are plain HTML
  * (#list-items .item); the watch page IS the detail page (.binfo/.bmeta).
  *
- * v2 (2026-11-10): episode list now matches the working Anikoto plugins:
- *  - newAnimeLoadResponse + addEpisodes(DubStatus.Subbed/Dubbed) -> the
- *    Sub/Dub toggle (the flat TvSeries list had none).
- *  - Real episode titles / scores / synopses from Jikan (MAL id = data-mal
- *    on the episode list; best-effort — falls back to "Episode N").
- *  - Episode poster = anime poster (the site has no per-episode stills;
- *    v1 left posterUrl unset -> broken-image placeholder).
- *  - Episode date from the site's data-timestamp (unix; verified Oct 5/12/
- *    19/26 2026 for Psyren), runTime from the page's Duration.
- *  - loadLinks emits one link PER server (v1 stopped after the first
- *    success, leaving a single fallback) + a fast path that builds the
- *    megaplay embed straight from the catalog API's episode_embed_id
- *    (anikotoapi.site/series/<id>), and links are named after the server
- *    ("HD-1 [Sub]") so the source picker lists them all.
+ * v3 (2026-11-11): stream resolution now matches Phisher's AniKoto v6
+ * (the working plugin on the user's phone — decompiled from its .cs3).
+ * The v2 chain (megaplay getSourcesNew -> AES decrypt -> raw master.m3u8
+ * emitted as ONE link per server) returned "No streams found" on the
+ * phone even though every step works from a VM. The working plugin
+ * resolves the same megaplay embeds differently:
+ *  - tries /stream/getSources THEN /stream/getSourcesNew, with
+ *    ?id=<data-id>&type=sub|dub, and reads the "sources" field first,
+ *    falling back to the AES-decrypted "enc" (same key/IV as v2).
+ *  - SIGNS the master URL (HMAC-SHA256 ?token=, 90 s expiry) before
+ *    use, the way the nexabloom CDN's signed-URL scheme expects.
+ *  - EXPANDS the signed master into ONE LINK PER QUALITY VARIANT
+ *    (1080p/720p/480p) instead of emitting the bare master — the
+ *    player then gets "Vidstream-2 [Sub] · 1080p" style sources
+ *    (Source 1 of 16 on the working plugin) with playback headers
+ *    (Referer + Origin: megaplay.buzz) on every link. Segments on
+ *    *.whereismyloot.site return 403 without that Referer.
+ *  - Extra backend: the nekostream mapper
+ *    (mapper.nekostream.site/api/mal/<mal>/<slug>/<ts>) as a fallback
+ *    — direct .m3u8/.mp4 downloads and extra embeds per source.
+ * Metadata (v2) is untouched: newAnimeLoadResponse + addEpisodes
+ * Sub/Dub, Jikan enrichment, posters, dates.
  *
  * Playback chain (verified end-to-end 2026-11-10, Black Clover ep 1 AND
  * Psyren ep 1):
@@ -111,10 +122,75 @@ class AnikotoProvider : MainAPI() {
         return h
     }
 
+    // AJAX headers for the megaplay getSources calls (Phisher's ajaxHeaders):
+    // Origin: megaplay.buzz is part of what the endpoint expects.
+    private fun megaAjaxHeaders(embedUrl: String): Map<String, String> = mapOf(
+        "User-Agent" to ua,
+        "Accept" to "*/*",
+        "X-Requested-With" to "XMLHttpRequest",
+        "Origin" to megaHost,
+        "Referer" to embedUrl,
+    )
+
     // Megaplay (megaplay.buzz) AES key/IV for the getSources "enc" field.
+    // Identical in Phisher's AniKoto v6 (verified from its decompiled .cs3).
     private val megaKeyStr = "i?LMTAx0Q6,:}50U"
     private val megaIvStr = "W0;27ToaUpl_P%'c"
     private val megaReferer = "https://megaplay.buzz/"
+    private val megaHost = "https://megaplay.buzz"
+    // HMAC secret for the ?token= signature appended to the master URL
+    // (Phisher's AniKoto v6, AnikotoExtractorsKt.MEGAPLAY_TOKEN_SECRET).
+    private val megaTokenSecret = "MpCdnT0k3n!9f2K#xQ7vL5mR8wN1pY4s"
+
+    // nekostream mapper — second stream backend (fallback).
+    private val mapperBase = "https://mapper.nekostream.site"
+
+    private val ua149 =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+
+    // CDN host remap used for #-hash direct links (Phisher PROXY_MAP):
+    // alternate player hosts -> the host that actually serves the file.
+    private val proxyMap = mapOf(
+        "vibeplayer.site" to "nanobyte.bigdreamsmalldih.site",
+        "vault-01.uwucdn.top" to "uwu1.bigdreamsmalldih.site",
+        "vault-02.uwucdn.top" to "uwu2.bigdreamsmalldih.site",
+        "vault-03.uwucdn.top" to "uwu3.bigdreamsmalldih.site",
+        "vault-04.uwucdn.top" to "uwu4.bigdreamsmalldih.site",
+        "vault-05.uwucdn.top" to "uwu5.bigdreamsmalldih.site",
+        "vault-06.uwucdn.top" to "uwu6.bigdreamsmalldih.site",
+        "vault-07.uwucdn.top" to "uwu7.bigdreamsmalldih.site",
+        "vault-08.uwucdn.top" to "uwu8.bigdreamsmalldih.site",
+        "vault-09.uwucdn.top" to "uwu9.bigdreamsmalldih.site",
+        "vault-10.uwucdn.top" to "uwu10.bigdreamsmalldih.site",
+        "vault-11.uwucdn.top" to "uwu11.bigdreamsmalldih.site",
+        "vault-12.uwucdn.top" to "uwu12.bigdreamsmalldih.site",
+        "vault-13.uwucdn.top" to "uwu13.bigdreamsmalldih.site",
+        "vault-14.uwucdn.top" to "uwu14.bigdreamsmalldih.site",
+        "vault-15.uwucdn.top" to "uwu15.bigdreamsmalldih.site",
+        "vault-16.uwucdn.top" to "uwu16.bigdreamsmalldih.site",
+        "vault-99.uwucdn.top" to "uwu17.bigdreamsmalldih.site",
+        "vault-10.owocdn.top" to "10.bigdreamsmalldih.site",
+        "vault-11.owocdn.top" to "11.bigdreamsmalldih.site",
+        "vault-12.owocdn.top" to "12.bigdreamsmalldih.site",
+        "vault-13.owocdn.top" to "13.bigdreamsmalldih.site",
+        "vault-14.owocdn.top" to "14.bigdreamsmalldih.site",
+        "vault-15.owocdn.top" to "15.bigdreamsmalldih.site",
+        "vault-16.owocdn.top" to "16.bigdreamsmalldih.site",
+        "vault-99.owocdn.top" to "99.bigdreamsmalldih.site",
+    )
+
+    private fun playbackHeaders(): Map<String, String> = mapOf(
+        "User-Agent" to ua,
+        "Accept" to "*/*",
+        "Origin" to megaHost,
+        "Referer" to megaReferer,
+    )
+
+    private fun serverTypeLabel(type: String): String = when (type.lowercase()) {
+        "hsub" -> "HSub"
+        "dub" -> "Dub"
+        else -> "Sub"
+    }
 
     // anikoto's public catalog API — gives mal/ani ids + per-episode embed ids
     // (direct megaplay URLs), so loadLinks has a fast path that skips the
@@ -147,32 +223,12 @@ class AnikotoProvider : MainAPI() {
         @JsonProperty("result") val result: ServerGetResult? = null,
     )
 
-    @JsonIgnoreProperties(ignoreUnknown = true)
-    data class GsTrack(
-        @JsonProperty("file") val file: String? = null,
-        @JsonProperty("src") val src: String? = null,
-        @JsonProperty("url") val url: String? = null,
-        @JsonProperty("label") val label: String? = null,
-        @JsonProperty("kind") val kind: String? = null,
-        @JsonProperty("default") val default: Boolean? = null,
-        @JsonProperty("isDefault") val isDefault: Boolean? = null,
-    )
-
-    @JsonIgnoreProperties(ignoreUnknown = true)
-    data class GsResp(
-        @JsonProperty("tracks") val tracks: List<GsTrack>? = null,
-        @JsonProperty("enc") val enc: String? = null,
-    )
-
-    @JsonIgnoreProperties(ignoreUnknown = true)
-    data class MegaFile(
-        @JsonProperty("file") val file: String? = null,
-    )
-
     // Data passed to loadLinks. embed = episode_embed_id from anikotoapi.site
     // (fast path); lang = "sub"/"dub" (the DubStatus the user tapped).
-    // Old v1 data ({ep, ids, url}) still parses: embed/lang default to null
-    // (lang -> "sub", fast path skipped).
+    // mal/slug/ts = the episode's data-mal / data-slug / data-timestamp, for
+    // the nekostream mapper fallback. Old v1 data ({ep, ids, url}) still
+    // parses: embed/lang/mal/slug/ts default to null (lang -> "sub",
+    // fast path + mapper skipped).
     @JsonIgnoreProperties(ignoreUnknown = true)
     data class EpisodeData(
         @JsonProperty("ep") val ep: Int? = null,
@@ -180,6 +236,9 @@ class AnikotoProvider : MainAPI() {
         @JsonProperty("url") val url: String? = null,
         @JsonProperty("embed") val embed: String? = null,
         @JsonProperty("lang") val lang: String? = null,
+        @JsonProperty("mal") val mal: String? = null,
+        @JsonProperty("slug") val slug: String? = null,
+        @JsonProperty("ts") val ts: String? = null,
     )
 
     // Jikan episode metadata (best-effort). Response:
@@ -229,10 +288,18 @@ class AnikotoProvider : MainAPI() {
         }
     }
 
-    /** AES-256-CBC decrypt of megaplay's getSources "enc" (base64url). */
+    /**
+     * AES-256-CBC decrypt of megaplay's getSources "enc" (base64url).
+     * Phisher's version: normalize the base64url alphabet to standard
+     * base64 + pad to a multiple of 4 before decoding (more robust than
+     * Base64.getUrlDecoder on unpadded input). Returns the decrypted
+     * "file" URL (the master .m3u8), or null. Same key/IV as v2.
+     */
     private fun decryptMegaplay(enc: String): String? {
         return try {
-            val ct = java.util.Base64.getUrlDecoder().decode(enc)
+            val normalized = enc.replace('-', '+').replace('_', '/')
+            val padded = normalized + "=".repeat((4 - normalized.length % 4) % 4)
+            val ct = java.util.Base64.getDecoder().decode(padded)
             val keyBytes = megaKeyStr.toByteArray(Charsets.UTF_8).copyOf(32)
             val ivBytes = megaIvStr.toByteArray(Charsets.UTF_8).copyOf(16)
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
@@ -241,22 +308,82 @@ class AnikotoProvider : MainAPI() {
                 SecretKeySpec(keyBytes, "AES"),
                 IvParameterSpec(ivBytes),
             )
-            String(cipher.doFinal(ct), Charsets.UTF_8)
+            val json = String(cipher.doFinal(ct), Charsets.UTF_8)
+            fileFromJsonText(json)
         } catch (e: Exception) {
             null
         }
     }
 
-    /** Best-effort: read the master playlist's max height for an accurate quality label. */
-    private suspend fun masterQuality(masterUrl: String): Int {
+    /** Pull the "file" (master .m3u8) out of a getSources JSON text. */
+    private fun fileFromJsonText(json: String): String? {
         return try {
-            val text = app.get(masterUrl, headers = mapOf("User-Agent" to ua, "Referer" to megaReferer)).text
-            val heights = Regex("RESOLUTION=\\d+x(\\d+)").findAll(text)
-                .mapNotNull { it.groupValues[1].toIntOrNull() }
-                .toList()
-            qualityFromHeight(heights.maxOrNull())
+            val trimmed = json.trim()
+            if (trimmed.startsWith("[")) {
+                val arr = org.json.JSONArray(trimmed)
+                if (arr.length() == 0) return null
+                arr.optJSONObject(0)?.optString("file")?.takeIf { it.isNotEmpty() }
+            } else {
+                JSONObject(trimmed).optString("file").takeIf { it.isNotEmpty() }
+            }
         } catch (e: Exception) {
-            Qualities.P1080.value
+            null
+        }
+    }
+
+    /**
+     * HMAC-SHA256 signature on the master URL (Phisher signMegaPlayUrl).
+     * The CDN's signed-URL scheme: payload = "<expiry>|<hash1>/<hash2>"
+     * (expiry = now + 90 s; the two 32-hex path segments), token =
+     * base64url(payload) + "." + base64url(HMAC-SHA256(payload)).
+     * Appended as ?token= (or &token=). URLs already carrying a token,
+     * or without the two hex segments, are returned unchanged.
+     */
+    private fun signMegaPlayUrl(url: String): String {
+        return try {
+            if ("token=" in url) return url
+            val m = Regex("/([a-f0-9]{32})/([a-f0-9]{32})/", RegexOption.IGNORE_CASE).find(url)
+                ?: return url
+            val payload =
+                "${System.currentTimeMillis() / 1000 + 90}|${m.groupValues[1]}/${m.groupValues[2]}"
+            val mac = Mac.getInstance("HmacSHA256")
+            mac.init(SecretKeySpec(megaTokenSecret.toByteArray(Charsets.UTF_8), "HmacSHA256"))
+            val sig = mac.doFinal(payload.toByteArray(Charsets.UTF_8))
+            val enc = java.util.Base64.getUrlEncoder().withoutPadding()
+            val token = enc.encodeToString(payload.toByteArray(Charsets.UTF_8)) + "." +
+                enc.encodeToString(sig)
+            url + (if ("?" in url) "&" else "?") + "token=$token"
+        } catch (e: Exception) {
+            url
+        }
+    }
+
+    /** CDN host remap for #-hash direct links (Phisher proxyPlayerHost). */
+    private fun proxyPlayerHost(url: String): String {
+        var out = url
+        for ((old, new) in proxyMap) out = out.replace(old, new)
+        return out
+    }
+
+    /**
+     * A #-hash direct link: the fragment after the first '#' is a base64
+     * m3u8 URL (host-remapped). Returns it, or null if not a valid one.
+     */
+    private fun getHashM3u8(url: String): String? {
+        return try {
+            val encoded = url.substringAfter("#", "").substringBefore("#").trim()
+            if (encoded.isEmpty()) return null
+            val decoded = try {
+                String(java.util.Base64.getDecoder().decode(encoded), Charsets.UTF_8)
+            } catch (e: Exception) {
+                val normalized = encoded.replace('-', '+').replace('_', '/')
+                val padded = normalized + "=".repeat((4 - normalized.length % 4) % 4)
+                String(java.util.Base64.getDecoder().decode(padded), Charsets.UTF_8)
+            }
+            val it = proxyPlayerHost(decoded)
+            if (it.startsWith("http") && ".m3u8" in it) it else null
+        } catch (e: Exception) {
+            null
         }
     }
 
@@ -441,7 +568,7 @@ class AnikotoProvider : MainAPI() {
         // Site episode data: the <a> carries data-num / data-ids / data-dub /
         // data-mal (MAL id) / data-timestamp (unix air date). It has NO real
         // title / rating / description / poster — those come from Jikan below.
-        data class SiteEp(val num: Int, val ids: String, val ts: Long?, val hasDub: Boolean, val mal: String)
+        data class SiteEp(val num: Int, val ids: String, val ts: Long?, val hasDub: Boolean, val mal: String, val slug: String)
         val siteEps = mutableListOf<SiteEp>()
         for (a in epDoc.select("a[data-id][data-num][data-ids]")) {
             val num = a.attr("data-num").toIntOrNull() ?: continue
@@ -450,7 +577,8 @@ class AnikotoProvider : MainAPI() {
             val ts = a.attr("data-timestamp").toLongOrNull()
             val hasDub = a.attr("data-dub").trim() == "1"
             val mal = a.attr("data-mal").trim()
-            siteEps.add(SiteEp(num, ids, ts, hasDub, mal))
+            val slug = a.attr("data-slug").trim().ifEmpty { num.toString() }
+            siteEps.add(SiteEp(num, ids, ts, hasDub, mal, slug))
         }
         if (siteEps.isEmpty()) return null
         siteEps.sortBy { it.num }
@@ -475,7 +603,7 @@ class AnikotoProvider : MainAPI() {
             // Oct 5, 2026, matching the working plugin); Jikan `aired` fallback.
             val tsMs = se.ts?.let { it * 1000L }
             val embedId = embedByNum[se.num]
-            val subData = toJson(EpisodeData(ep = se.num, ids = se.ids, url = url, embed = embedId, lang = "sub")) ?: continue
+            val subData = toJson(EpisodeData(ep = se.num, ids = se.ids, url = url, embed = embedId, lang = "sub", mal = se.mal, slug = se.slug, ts = se.ts?.toString())) ?: continue
             if (firstEpData == null) firstEpData = subData
             subEps.add(newEpisode(subData) {
                 this.name = epName
@@ -494,7 +622,7 @@ class AnikotoProvider : MainAPI() {
                 this.runTime = durationMin
             })
             if (se.hasDub) {
-                val dubData = toJson(EpisodeData(ep = se.num, ids = se.ids, url = url, embed = embedId, lang = "dub")) ?: continue
+                val dubData = toJson(EpisodeData(ep = se.num, ids = se.ids, url = url, embed = embedId, lang = "dub", mal = se.mal, slug = se.slug, ts = se.ts?.toString())) ?: continue
                 dubEps.add(newEpisode(dubData) {
                     this.name = "$epName (Dub)"
                     this.episode = se.num
@@ -539,9 +667,17 @@ class AnikotoProvider : MainAPI() {
 
     // ---- streams ----
 
-    /** Resolve one megaplay embed URL to its master.m3u8 and emit it.
-     *  The link is named after the server ("HD-1 [Sub]") so the source
-     *  picker lists one entry per server, like the working plugin. */
+    // ---- streams ----
+
+    /**
+     * Resolve one megaplay/vidwish/vidtube embed URL and emit its streams.
+     * Phisher's extractMegaPlayUrl, adapted: fetch the embed page ->
+     * #megaplay-player data-id -> /stream/getSources THEN
+     * /stream/getSourcesNew (?id=<data-id>&type=sub|dub) -> read the
+     * "sources" field first, else AES-decrypt "enc" -> master .m3u8 ->
+     * SIGN it -> expand it into one link per quality variant. Returns
+     * true if at least one link was emitted.
+     */
     private suspend fun resolveMegaplay(
         embedUrl: String,
         watchUrl: String,
@@ -554,59 +690,319 @@ class AnikotoProvider : MainAPI() {
             val embedHtml = app.get(embedUrl, headers = pageHeaders(watchUrl)).text
             val embedDoc = Jsoup.parse(embedHtml)
             val player = embedDoc.selectFirst("#megaplay-player") ?: return false
-            val fileId = player.attr("data-id").trim()
-            val realId = player.attr("data-realid").trim()
-            // data-id first (full subtitle tracks); realid as fallback.
-            val ids = listOf(fileId, realId).filter { it.isNotEmpty() }.distinct()
-            for (id in ids) {
+            val streamId = player.attr("data-id").trim()
+            if (streamId.isEmpty()) return false
+            val type = if ("/dub" in embedUrl) "dub" else "sub"
+            val host = "https://" + try { URL(embedUrl).host } catch (e: Exception) { "megaplay.buzz" }
+            // megaplay.buzz tries getSources first; other hosts getSourcesNew first.
+            val endpoints = if ("megaplay.buzz" in host) {
+                listOf("/stream/getSources", "/stream/getSourcesNew")
+            } else {
+                listOf("/stream/getSourcesNew", "/stream/getSources")
+            }
+            for (path in endpoints) {
                 try {
-                    val gs = app.get(
-                        "https://megaplay.buzz/stream/getSourcesNew?id=$id",
-                        headers = ajaxHeaders(embedUrl),
-                    ).parsed<GsResp>()
-                    val enc = gs.enc ?: continue
-                    val plain = decryptMegaplay(enc) ?: continue
-                    val master = tryParseJson<MegaFile>(plain)?.file?.trim() ?: continue
-                    if (master.isEmpty()) continue
-                    // Quality is read in suspend context BEFORE newExtractorLink —
-                    // the builder lambda must only assign plain values (Miruro pattern).
-                    val quality = masterQuality(master)
+                    val text = app.get(
+                        "$host$path?id=$streamId&type=$type",
+                        headers = megaAjaxHeaders(embedUrl),
+                    ).text
+                    val json = JSONObject(text)
+                    // "sources" first (object {"file":...} or array [{file:...}]).
+                    var file: String? = null
+                    when (val sources = json.opt("sources")) {
+                        is JSONObject -> file = sources.optString("file").takeIf { it.isNotEmpty() }
+                        is org.json.JSONArray -> {
+                            if (sources.length() > 0) {
+                                file = sources.optJSONObject(0)?.optString("file")?.takeIf { it.isNotEmpty() }
+                            }
+                        }
+                    }
+                    if (file.isNullOrBlank()) {
+                        val enc = json.optString("enc")
+                        if (enc.isNotEmpty()) file = decryptMegaplay(enc)
+                    }
+                    val master = file?.trim()?.takeIf { it.isNotEmpty() } ?: continue
+                    val signed = signMegaPlayUrl(master)
+                    val label = "$serverName [$tag]"
                     // Subtitles (best-effort: mysubsplay.com 403s from some networks).
                     try {
-                        for (t in gs.tracks ?: emptyList()) {
-                            val kind = t.kind
-                            if (kind != null && kind != "captions" && kind != "subtitles") continue
-                            val file = t.file ?: t.src ?: t.url ?: continue
-                            subtitleCallback(SubtitleFile(t.label ?: "Unknown", file))
+                        val tracks = json.optJSONArray("tracks")
+                        if (tracks != null) {
+                            for (i in 0 until tracks.length()) {
+                                val t = tracks.optJSONObject(i) ?: continue
+                                val kind = t.optString("kind")
+                                if (kind != "captions" && kind != "subtitles") continue
+                                val f = t.optString("file").ifEmpty { t.optString("src") }
+                                    .ifEmpty { t.optString("url") }
+                                if (f.isEmpty()) continue
+                                val trackUrl = if (f.startsWith("http")) f else host + "/" + f.removePrefix("/")
+                                subtitleCallback(SubtitleFile(t.optString("label").ifEmpty { "Unknown" }, trackUrl))
+                            }
                         }
                     } catch (e: Exception) {
                         // Subtitles must never kill the stream.
                     }
-                    try {
-                        callback(
-                            newExtractorLink(
-                                source = "Anikoto",
-                                name = "$serverName [$tag]",
-                                url = master,
-                                type = ExtractorLinkType.M3U8,
-                            ) {
-                                this.quality = quality
-                                this.referer = megaReferer
-                                this.headers = mapOf(
-                                    "Referer" to megaReferer,
-                                    "User-Agent" to ua,
-                                )
-                            }
-                        )
-                        return true
-                    } catch (e: Exception) {
-                        continue
-                    }
+                    if (expandMaster(signed, label, callback)) return true
                 } catch (e: Exception) {
                     continue
                 }
             }
             false
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Fetch a (signed) master playlist and emit ONE link per quality
+     * variant — the working plugin's M3u8Helper.generateM3u8 behaviour.
+     * Each variant URL is resolved relative to the master URL and tagged
+     * with #<serverTag> (server name, spaces stripped). Returns true if
+     * at least one link was emitted. If the URL is not a master playlist
+     * (no #EXT-X-STREAM-INF), it is emitted as-is as a single link.
+     */
+    private suspend fun expandMaster(
+        masterUrl: String,
+        label: String,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        return try {
+            val text = app.get(masterUrl, headers = playbackHeaders()).text
+            val lines = text.lines()
+            var emitted = false
+            var i = 0
+            while (i < lines.size) {
+                val line = lines[i].trim()
+                if (line.startsWith("#EXT-X-STREAM-INF")) {
+                    val height = Regex("RESOLUTION=\\d+x(\\d+)").find(line)
+                        ?.groupValues?.get(1)?.toIntOrNull()
+                    val quality = qualityFromHeight(height)
+                    var j = i + 1
+                    var variant: String? = null
+                    while (j < lines.size) {
+                        val v = lines[j].trim()
+                        if (v.isNotEmpty() && !v.startsWith("#")) {
+                            variant = v
+                            break
+                        }
+                        j++
+                    }
+                    if (variant != null) {
+                        val abs = try {
+                            URL(URL(masterUrl), variant).toString()
+                        } catch (e: Exception) {
+                            variant
+                        }
+                        val serverTag = label.substringBefore(" [").replace(" ", "")
+                        val tagged = if ("#" in abs) abs else "$abs#$serverTag"
+                        try {
+                            callback(
+                                newExtractorLink(
+                                    source = "Anikoto",
+                                    name = label,
+                                    url = tagged,
+                                    type = ExtractorLinkType.M3U8,
+                                ) {
+                                    this.quality = quality
+                                    this.referer = megaReferer
+                                    this.headers = playbackHeaders()
+                                }
+                            )
+                            emitted = true
+                        } catch (e: Exception) {
+                            // This variant failed — try the next one.
+                        }
+                        i = j + 1
+                        continue
+                    }
+                }
+                i++
+            }
+            if (!emitted) {
+                // Not a master playlist — emit the URL itself as one link.
+                try {
+                    val serverTag = label.substringBefore(" [").replace(" ", "")
+                    val tagged = if ("#" in masterUrl) masterUrl else "$masterUrl#$serverTag"
+                    callback(
+                        newExtractorLink(
+                            source = "Anikoto",
+                            name = label,
+                            url = tagged,
+                            type = ExtractorLinkType.M3U8,
+                        ) {
+                            this.quality = Qualities.P1080.value
+                            this.referer = megaReferer
+                            this.headers = playbackHeaders()
+                        }
+                    )
+                    emitted = true
+                } catch (e: Exception) {
+                    // Nothing could be emitted.
+                }
+            }
+            emitted
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Resolve one embed URL from the site server list or the mapper.
+     * Phisher's resolveEmbed: a #-hash URL is a direct base64 m3u8 link
+     * (emitted as-is); megaplay/vidwish/vidtube go through the megaplay
+     * resolver; anything else goes through the generic extractor.
+     */
+    private suspend fun resolveEmbed(
+        embedUrlRaw: String,
+        referer: String,
+        serverName: String,
+        serverType: String,
+        callback: (ExtractorLink) -> Unit,
+        subtitleCallback: (SubtitleFile) -> Unit,
+    ): Boolean {
+        return try {
+            val normalized = when {
+                embedUrlRaw.startsWith("//") -> "https:$embedUrlRaw"
+                embedUrlRaw.startsWith("/") -> mainUrl + embedUrlRaw
+                else -> embedUrlRaw
+            }
+            val typeLabel = serverTypeLabel(serverType)
+            // #-hash direct link.
+            val hashM3u8 = getHashM3u8(normalized)
+            if (hashM3u8 != null) {
+                val serverTag = serverName.replace(" ", "")
+                val tagged = if ("#" in hashM3u8) hashM3u8 else "$hashM3u8#$serverTag"
+                return try {
+                    callback(
+                        newExtractorLink(
+                            source = "Anikoto",
+                            name = "$serverName [$typeLabel]",
+                            url = tagged,
+                            type = ExtractorLinkType.M3U8,
+                        ) {
+                            this.referer = normalized
+                            this.headers = playbackHeaders()
+                        }
+                    )
+                    true
+                } catch (e: Exception) {
+                    false
+                }
+            }
+            val domain = try { URL(normalized).host } catch (e: Exception) { "" }
+            val isMega = "megaplay" in domain || "vidwish" in domain || "vidtube" in domain
+            if (isMega) {
+                return resolveMegaplay(normalized, referer, serverName, typeLabel, callback, subtitleCallback)
+            }
+            // Generic extractor for anything else.
+            return try {
+                loadExtractor(normalized, subtitleCallback, callback)
+            } catch (e: Exception) {
+                false
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * nekostream mapper fallback (Phisher's resolveMapperServers).
+     * GET mapper.nekostream.site/api/mal/<mal>/<slug>/<ts> — for each
+     * source, resolve its embed URL and emit any direct .m3u8/.mp4
+     * downloads. Returns true if at least one link was emitted.
+     */
+    private suspend fun resolveMapperServers(
+        malId: String?,
+        slug: String?,
+        timestamp: String?,
+        audioType: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit,
+        subtitleCallback: (SubtitleFile) -> Unit,
+    ): Boolean {
+        if (malId.isNullOrBlank() || slug.isNullOrBlank() || timestamp.isNullOrBlank()) return false
+        return try {
+            val text = app.get(
+                "$mapperBase/api/mal/$malId/$slug/$timestamp",
+                headers = mapOf(
+                    "User-Agent" to ua149,
+                    "Accept" to "application/json",
+                ),
+            ).text
+            val root = JSONObject(text)
+            var found = false
+            val keys = root.keys()
+            while (keys.hasNext()) {
+                val sourceKey = keys.next()
+                if (sourceKey == "status") continue
+                val sourceObj = root.optJSONObject(sourceKey) ?: continue
+                try {
+                    var audioObj = sourceObj.optJSONObject(audioType)
+                    if (audioObj == null) audioObj = sourceObj.optJSONObject("sub")
+                    if (audioObj == null) continue
+                    val sName = when (sourceKey.lowercase().trim()) {
+                        "vibe-stream" -> "Vibe-Stream"
+                        "gogoanime" -> "Vidstream"
+                        "kiwi" -> "Kiwi-Stream"
+                        else -> sourceKey.replaceFirstChar { it.uppercase() }
+                    }
+                    val embedUrl = audioObj.optString("url").takeIf { it.isNotEmpty() }
+                    if (embedUrl != null) {
+                        try {
+                            if (resolveEmbed(embedUrl, referer, sName, audioType, callback, subtitleCallback)) {
+                                found = true
+                            }
+                        } catch (e: Exception) {
+                            // This source failed — try the next one.
+                        }
+                    }
+                    val downloads = audioObj.optJSONObject("download")
+                    if (downloads != null) {
+                        val dkeys = downloads.keys()
+                        while (dkeys.hasNext()) {
+                            val resKey = dkeys.next()
+                            val dlUrl = downloads.optString(resKey)
+                            if (dlUrl.isEmpty()) continue
+                            val typeLabel = serverTypeLabel(audioType)
+                            val dlName = "$sName [$resKey] [$typeLabel]"
+                            try {
+                                if (".m3u8" in dlUrl) {
+                                    callback(
+                                        newExtractorLink(
+                                            source = "Anikoto",
+                                            name = dlName,
+                                            url = dlUrl,
+                                            type = ExtractorLinkType.M3U8,
+                                        ) {
+                                            this.referer = megaReferer
+                                            this.headers = playbackHeaders()
+                                        }
+                                    )
+                                    found = true
+                                } else if (".mp4" in dlUrl) {
+                                    callback(
+                                        newExtractorLink(
+                                            source = "Anikoto",
+                                            name = dlName,
+                                            url = dlUrl,
+                                            type = ExtractorLinkType.VIDEO,
+                                        ) {
+                                            this.referer = megaReferer
+                                            this.headers = playbackHeaders()
+                                        }
+                                    )
+                                    found = true
+                                }
+                            } catch (e: Exception) {
+                                // This download failed — try the next one.
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    // This source failed — try the next one.
+                }
+            }
+            found
         } catch (e: Exception) {
             false
         }
@@ -642,9 +1038,10 @@ class AnikotoProvider : MainAPI() {
             }
         }
 
-        // Site server list — try EVERY server and emit one link per server
-        // (the working plugin lists ~16 sources; v1 stopped after the first
-        // success, leaving the player with a single fallback).
+        // Site server list — try EVERY server (requested audio first,
+        // hsub grouped with sub) and resolve each embed. The working
+        // plugin lists ~16 sources because every server expands into
+        // per-variant links; v2 emitted one bare master per server.
         if (!ids.isNullOrBlank()) {
             try {
                 val srv = app.get(
@@ -662,7 +1059,8 @@ class AnikotoProvider : MainAPI() {
                     }
                 }
                 // Requested audio first, then the other audio as fallback.
-                val ordered = servers.filter { it.type == lang } + servers.filter { it.type != lang }
+                val ordered = servers.filter { it.type == lang || (lang == "sub" && it.type == "hsub") } +
+                    servers.filter { it.type != lang && !(lang == "sub" && it.type == "hsub") }
                 for (server in ordered) {
                     try {
                         val got = app.get(
@@ -671,9 +1069,8 @@ class AnikotoProvider : MainAPI() {
                         ).parsed<ServerGetResp>()
                         val embedUrl = got.result?.url?.trim() ?: continue
                         if (embedUrl.isEmpty() || !seenEmbeds.add(embedUrl)) continue
-                        val tag = if (server.type == "dub") "Dub" else "Sub"
                         try {
-                            if (resolveMegaplay(embedUrl, watchUrl, server.name.ifEmpty { "Server" }, tag, callback, subtitleCallback)) {
+                            if (resolveEmbed(embedUrl, watchUrl, server.name.ifEmpty { "Server" }, server.type, callback, subtitleCallback)) {
                                 found = true
                             }
                         } catch (e: Exception) {
@@ -686,6 +1083,15 @@ class AnikotoProvider : MainAPI() {
             } catch (e: Exception) {
                 // loadLinks must not throw.
             }
+        }
+
+        // Mapper fallback (second backend, independent of anikoto.cz).
+        try {
+            if (resolveMapperServers(ep.mal, ep.slug, ep.ts, lang, watchUrl, callback, subtitleCallback)) {
+                found = true
+            }
+        } catch (e: Exception) {
+            // Mapper failure must not kill the site-server links.
         }
         return found
     }

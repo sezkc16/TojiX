@@ -19,3 +19,7 @@ cloudstream {
 
     isCrossPlatform = true
 }
+
+android {
+    namespace = "com.katdrama"
+}

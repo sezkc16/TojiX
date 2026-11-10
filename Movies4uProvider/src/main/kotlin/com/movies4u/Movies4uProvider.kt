@@ -172,7 +172,7 @@ class Movies4uProvider : MainAPI() {
             val epMap = linkedMapOf<Pair<Int, Int>, MutableList<LinkEntry>>()
             var currentHeading = ""
             var currentSeason = 1
-            for (el in content.allElements) {
+            for (el in content.allElements()) {
                 val tag = el.tagName()
                 if (tag.matches(Regex("h[1-6]"))) {
                     currentHeading = el.text().trim()
@@ -242,7 +242,7 @@ class Movies4uProvider : MainAPI() {
             val links = mutableListOf<LinkEntry>()
             val seenIds = mutableSetOf<String>()
             var currentHeading = ""
-            for (el in content.allElements) {
+            for (el in content.allElements()) {
                 val tag = el.tagName()
                 if (tag.matches(Regex("h[1-6]"))) {
                     currentHeading = el.text().trim()

@@ -1,5 +1,6 @@
 package com.multimovies
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.fasterxml.jackson.core.type.TypeReference
 import com.fasterxml.jackson.databind.ObjectMapper
@@ -58,6 +59,7 @@ class MultiMoviesProvider : MainAPI() {
     // Vidrift embed page: var embedMeta = {...} (JSON). orionStreams is a
     // list of direct mp4s for movies, null for TV (streams come from
     // /api/source instead).
+    @JsonIgnoreProperties(ignoreUnknown = true)
     data class EmbedMeta(
         @JsonProperty("tmdbId") val tmdbId: String? = null,
         @JsonProperty("type") val type: String? = null,
@@ -68,6 +70,7 @@ class MultiMoviesProvider : MainAPI() {
         @JsonProperty("orionStreams") val orionStreams: List<OrionStream>? = null,
     )
 
+    @JsonIgnoreProperties(ignoreUnknown = true)
     data class OrionStream(
         @JsonProperty("index") val index: Int? = null,
         @JsonProperty("url") val url: String? = null,
@@ -79,6 +82,7 @@ class MultiMoviesProvider : MainAPI() {
     )
 
     // Vidrift /api/source response: {streams: [...], subtitles: [...]}
+    @JsonIgnoreProperties(ignoreUnknown = true)
     data class ApiSourceResponse(
         @JsonProperty("streams") val streams: List<OrionStream>? = null,
         @JsonProperty("subtitles") val subtitles: List<Map<String, Any?>>? = null,
@@ -286,13 +290,17 @@ class MultiMoviesProvider : MainAPI() {
         // Vidrift first (verified direct mp4s), then Filmu (verified HLS),
         // then everything else via loadExtractor (best effort).
         for (u in serverUrls) {
-            when {
-                u.contains("vidrift.net") -> {
-                    if (resolveVidrift(u, isTv, subtitleCallback, callback)) found = true
+            try {
+                when {
+                    u.contains("vidrift.net") -> {
+                        if (resolveVidrift(u, isTv, subtitleCallback, callback)) found = true
+                    }
+                    u.contains("filmu.in") || u.contains("vidly.pro") -> {
+                        if (resolveFilmu(u, isTv, subtitleCallback, callback)) found = true
+                    }
                 }
-                u.contains("filmu.in") || u.contains("vidly.pro") -> {
-                    if (resolveFilmu(u, isTv, subtitleCallback, callback)) found = true
-                }
+            } catch (e: Exception) {
+                // one dead server must not kill the rest
             }
         }
         for (u in serverUrls) {
@@ -328,7 +336,17 @@ class MultiMoviesProvider : MainAPI() {
                 object : TypeReference<List<Map<String, Any?>>>() {}
             )
         } catch (e: Exception) {
-            null
+            // Vidrift subtitles.json is an object: {"tracks": [{...}]}
+            try {
+                val obj = ObjectMapper().readValue(
+                    json,
+                    object : TypeReference<Map<String, Any?>>() {}
+                )
+                val list = (obj["tracks"] as? List<*>) ?: (obj["subtitles"] as? List<*>)
+                list?.filterIsInstance<Map<String, Any?>>()
+            } catch (e2: Exception) {
+                null
+            }
         }
     }
 
@@ -343,7 +361,14 @@ class MultiMoviesProvider : MainAPI() {
         val full = if (path.startsWith("http")) path else "$vidriftBase$path"
         try {
             val json = app.get(full, headers = browserHeaders + mapOf("Referer" to referer)).text
-            emitSubtitles(parseSubtitleListJson(json), subtitleCallback)
+            // Subtitle track URLs are relative (/api/orion/.../*.vtt) —
+            // resolve them against the embed host like the stream URLs.
+            val parsed = parseSubtitleListJson(json)?.map { entry ->
+                val u = (entry["url"] as? String)?.takeIf { it.isNotBlank() }
+                    ?: (entry["file"] as? String)?.takeIf { it.isNotBlank() }
+                if (u != null && !u.startsWith("http")) entry + ("url" to "$vidriftBase$u") else entry
+            }
+            emitSubtitles(parsed, subtitleCallback)
         } catch (e: Exception) {
             // subtitles are optional
         }
@@ -354,9 +379,12 @@ class MultiMoviesProvider : MainAPI() {
         embedUrl: String,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val fileUrl = stream.url?.takeIf { it.isNotBlank() }
+        val rawUrl = stream.url?.takeIf { it.isNotBlank() }
             ?: stream.proxyUrl?.takeIf { it.isNotBlank() }
             ?: return false
+        // orionStreams URLs are relative (/api/orion/<hash>/master.m3u8) —
+        // resolve against the embed host or the player gets an unusable URL.
+        val fileUrl = if (rawUrl.startsWith("http")) rawUrl else "$vidriftBase$rawUrl"
         val name = "MultiMovies Vidrift ${stream.name?.trim() ?: "Video"}".trim()
         callback(
             newExtractorLink(
@@ -400,7 +428,11 @@ class MultiMoviesProvider : MainAPI() {
         val warm = meta.orionStreams.orEmpty()
         if (warm.isNotEmpty()) {
             for (stream in warm) {
-                if (emitOrionStream(stream, embedUrl, callback)) found = true
+                try {
+                    if (emitOrionStream(stream, embedUrl, callback)) found = true
+                } catch (e: Exception) {
+                    // one bad stream must not kill the rest
+                }
                 fetchOrionSubtitles(stream.subtitleListUrl, embedUrl, subtitleCallback)
             }
             return found
@@ -435,7 +467,11 @@ class MultiMoviesProvider : MainAPI() {
             val parsed = tryParseJson<ApiSourceResponse>(resp) ?: return false
             emitSubtitles(parsed.subtitles, subtitleCallback)
             for (stream in parsed.streams.orEmpty()) {
-                if (emitOrionStream(stream, embedUrl, callback)) found = true
+                try {
+                    if (emitOrionStream(stream, embedUrl, callback)) found = true
+                } catch (e: Exception) {
+                    // one bad stream must not kill the rest
+                }
                 fetchOrionSubtitles(stream.subtitleListUrl, embedUrl, subtitleCallback)
             }
             found
@@ -445,70 +481,123 @@ class MultiMoviesProvider : MainAPI() {
         }
     }
 
+    // Unescape a bridge/stream URL found in page HTML: JSON-escaped
+    // \u0026 and HTML-escaped &amp; / &quot; both occur on vidly pages.
+    private fun unescapePageUrl(raw: String): String {
+        return raw.replace("\\u0026", "&")
+            .replace("&amp;", "&")
+            .replace("&quot;", "\"")
+            .trim()
+    }
+
+    // Emit any Filmu HLS links found in `html` (bridge + streamrip).
+    // Returns true if at least one link was emitted. Never throws.
+    private suspend fun emitFilmuLinks(
+        html: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        var found = false
+        // Signed HLS bridge URL. Several occurrences can exist (JSON-escaped
+        // \u0026 form and HTML-escaped &amp; form); unescape all and keep
+        // the longest (most complete) signed URL.
+        try {
+            val bridgeRe = Regex("""https://dash-hls-bridge\.johndoesdmc\.workers\.dev/(?:\\u0026|[^"\\])*""")
+            val bridge = bridgeRe.findAll(html)
+                .map { unescapePageUrl(it.value) }
+                .filter { it.isNotBlank() }
+                .maxByOrNull { it.length }
+            if (bridge != null) {
+                callback(
+                    newExtractorLink(
+                        source = "MultiMovies Filmu",
+                        name = "MultiMovies Filmu HLS",
+                        url = bridge,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.headers = mapOf(
+                            "User-Agent" to (browserHeaders["User-Agent"] ?: ""),
+                            "Referer" to referer,
+                        )
+                        quality = Qualities.Unknown.value
+                    }
+                )
+                found = true
+            }
+        } catch (e: Exception) {
+            // a bad bridge link must not kill the streamrip fallback
+        }
+
+        // streamrip master m3u8 (also checked on TV pages as a fallback).
+        try {
+            val ripRe = Regex("""https://proxy\.streamrip\.fun/m/[^\s"\\]+""")
+            val rip = ripRe.find(html)?.value?.takeIf { it.isNotBlank() }
+            if (rip != null) {
+                callback(
+                    newExtractorLink(
+                        source = "MultiMovies Filmu",
+                        name = "MultiMovies Filmu HLS",
+                        url = rip,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.headers = mapOf(
+                            "User-Agent" to (browserHeaders["User-Agent"] ?: ""),
+                            "Referer" to referer,
+                        )
+                        quality = Qualities.Unknown.value
+                    }
+                )
+                found = true
+            }
+        } catch (e: Exception) {
+            // best effort
+        }
+        return found
+    }
+
     // Filmu embed: https://embed.filmu.in/movie|tv/... 301s to vidly.pro.
     // Movie pages contain a proxy.streamrip.fun master m3u8; TV pages bake
     // a SIGNED dash-hls-bridge URL (JSON-escaped \u0026 = & — must be
-    // unescaped before use; the unsigned URL 502s).
+    // unescaped before use; the unsigned URL 502s). Viruman (movie) also
+    // carries a signed bridge URL, so both regexes run on every page.
     private suspend fun resolveFilmu(
         embedUrl: String,
         isTv: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val resp = try {
-            app.get(embedUrl, headers = browserHeaders + mapOf("Referer" to "$mainUrl/"))
+        return try {
+            var found = false
+            // 1) Fetch the embed (301s to vidly.pro) and extract links.
+            var html: String? = null
+            var referer = embedUrl
+            try {
+                val resp = app.get(embedUrl, headers = browserHeaders + mapOf("Referer" to "$mainUrl/"))
+                html = resp.text
+                referer = resp.url
+            } catch (e: Exception) {
+                html = null
+            }
+            if (html != null) {
+                found = emitFilmuLinks(html, referer, callback) || found
+            }
+            // 2) Fallback: if nothing found, fetch vidly.pro directly and
+            // re-run the extraction (the embed 301 may not be followed
+            // in-app, or the page may differ).
+            if (!found) {
+                val vidlyUrl = embedUrl.replace("embed.filmu.in", "vidly.pro")
+                if (vidlyUrl != embedUrl) {
+                    try {
+                        val resp2 = app.get(vidlyUrl, headers = browserHeaders + mapOf("Referer" to "$mainUrl/"))
+                        found = emitFilmuLinks(resp2.text, resp2.url, callback) || found
+                    } catch (e: Exception) {
+                        // best effort
+                    }
+                }
+            }
+            found
         } catch (e: Exception) {
-            return false
+            false
         }
-        val html = resp.text
-        val finalUrl = resp.url
-
-        var found = false
-
-        // TV: signed HLS bridge URL (use the full signed URL as baked).
-        val bridgeRe = Regex("""https://dash-hls-bridge\.johndoesdmc\.workers\.dev/(?:\\u0026|[^"\\])*""")
-        val bridge = bridgeRe.find(html)?.value
-            ?.replace("\\u0026", "&")
-            ?.takeIf { it.isNotBlank() }
-        if (bridge != null) {
-            callback(
-                newExtractorLink(
-                    source = "MultiMovies Filmu",
-                    name = "MultiMovies Filmu HLS",
-                    url = bridge,
-                    type = ExtractorLinkType.M3U8
-                ) {
-                    this.headers = mapOf(
-                        "User-Agent" to (browserHeaders["User-Agent"] ?: ""),
-                        "Referer" to finalUrl,
-                    )
-                    quality = Qualities.Unknown.value
-                }
-            )
-            found = true
-        }
-
-        // Movie: streamrip master m3u8 (also checked on TV pages as a
-        // fallback — harmless if absent).
-        val ripRe = Regex("""https://proxy\.streamrip\.fun/m/[^\s"\\]+""")
-        val rip = ripRe.find(html)?.value?.takeIf { it.isNotBlank() }
-        if (rip != null) {
-            callback(
-                newExtractorLink(
-                    source = "MultiMovies Filmu",
-                    name = "MultiMovies Filmu HLS",
-                    url = rip,
-                    type = ExtractorLinkType.M3U8
-                ) {
-                    this.headers = mapOf(
-                        "User-Agent" to (browserHeaders["User-Agent"] ?: ""),
-                        "Referer" to finalUrl,
-                    )
-                    quality = Qualities.Unknown.value
-                }
-            )
-            found = true
-        }
-        return found
     }
 }

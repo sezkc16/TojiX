@@ -423,7 +423,8 @@ class GokuHDProvider : MainAPI() {
                 }
             }
             val episodes = mutableListOf<Episode>()
-            for (((season, epNum), links) in epMap) {
+            for ((key, links) in epMap) {
+                val (season, epNum) = key
                 val dataJson = toJson(EpisodeData(links)) ?: continue
                 episodes.add(newEpisode(dataJson) {
                     this.name = "Episode $epNum"

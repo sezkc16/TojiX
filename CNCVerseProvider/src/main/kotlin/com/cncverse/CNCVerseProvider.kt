@@ -1,5 +1,7 @@
 package com.cncverse
 
+import com.lagradost.cloudstream3.Actor
+import com.lagradost.cloudstream3.ActorData
 import com.lagradost.cloudstream3.Episode as CloudEpisode
 import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.HomePageResponse
@@ -9,11 +11,11 @@ import com.lagradost.cloudstream3.MainPageRequest
 import com.lagradost.cloudstream3.Score
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.TvType
+import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.newAnimeSearchResponse
 import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
-import com.lagradost.cloudstream3.utils.AppUtils
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -84,6 +86,15 @@ class CNCVerseProvider : MainAPI() {
     private fun posterHeaders(): Map<String, String> =
         mapOf("Referer" to "$mainUrl/home")
 
+    /** Serializes a small data object (Id / LoadData) to JSON for a card/episode URL. */
+    private fun toJson(data: Any): String {
+        return try {
+            com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(data)
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
     // ------------------------------------------------------------------ home
 
     override suspend fun getMainPage(
@@ -112,7 +123,7 @@ class CNCVerseProvider : MainAPI() {
         val id = element.selectFirst("a")?.attr("data-post")
             ?: element.attr("data-post")
         if (id.isBlank()) return null
-        return newAnimeSearchResponse("", AppUtils.toJson(Id(id)), fix = false) {
+        return newAnimeSearchResponse("", toJson(Id(id)), fix = false) {
             this.posterUrl = poster(id)
             this.posterHeaders = posterHeaders()
         }
@@ -127,7 +138,7 @@ class CNCVerseProvider : MainAPI() {
             .parsed<SearchData>()
         return data.searchResult?.mapNotNull { result ->
             val id = result.id ?: return@mapNotNull null
-            newAnimeSearchResponse(result.t ?: "", AppUtils.toJson(Id(id)), fix = false) {
+            newAnimeSearchResponse(result.t ?: "", toJson(Id(id)), fix = false) {
                 this.posterUrl = poster(id)
                 this.posterHeaders = posterHeaders()
             }
@@ -158,7 +169,7 @@ class CNCVerseProvider : MainAPI() {
         val runTime = CNCVerseUtils.convertRuntimeToMinutes(data.runtime.orEmpty())
         val suggest = data.suggest?.mapNotNull { s ->
             val sid = s.id ?: return@mapNotNull null
-            newAnimeSearchResponse("", AppUtils.toJson(Id(sid)), fix = false) {
+            newAnimeSearchResponse("", toJson(Id(sid)), fix = false) {
                 this.posterUrl = poster(sid)
                 this.posterHeaders = posterHeaders()
             }
@@ -175,7 +186,7 @@ class CNCVerseProvider : MainAPI() {
                 this.plot = data.desc
                 this.year = data.year?.toIntOrNull()
                 this.tags = genre
-                this.actors = cast
+                this.actors = cast.map { ActorData(actor = Actor(it)) }
                 this.score = Score.from10(rating)
                 this.duration = runTime
                 this.contentRating = data.ua
@@ -197,7 +208,7 @@ class CNCVerseProvider : MainAPI() {
             this.plot = data.desc
             this.year = data.year?.toIntOrNull()
             this.tags = genre
-            this.actors = cast
+            this.actors = cast.map { ActorData(actor = Actor(it)) }
             this.score = Score.from10(rating)
             this.duration = runTime
             this.contentRating = data.ua
@@ -259,7 +270,7 @@ class CNCVerseProvider : MainAPI() {
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Boolean
+        callback: (ExtractorLink) -> Unit
     ): Boolean {
         val loadData = tryParseJson<LoadData>(data) ?: return false
         val id = loadData.id?.takeIf { it.isNotBlank() } ?: return false

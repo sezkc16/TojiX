@@ -1,6 +1,6 @@
 package com.cncverse
 
-import com.lagradost.cloudstream3.utils.Requests
+import com.lagradost.nicehttp.Requests
 import okhttp3.FormBody
 import okhttp3.OkHttpClient
 import okhttp3.Request

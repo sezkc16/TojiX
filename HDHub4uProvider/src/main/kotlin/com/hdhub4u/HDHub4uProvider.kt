@@ -103,7 +103,7 @@ class HDHub4uProvider : MainAPI() {
         return out
     }
 
-    override fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val cat = request.data
         val url = when {
             cat.isEmpty() -> if (page <= 1) mainUrl else "$mainUrl/page/$page/"
@@ -115,22 +115,20 @@ class HDHub4uProvider : MainAPI() {
         return newHomePageResponse(HomePageList(request.name, list), hasNext = list.isNotEmpty())
     }
 
-    override suspend fun search(query: String): SearchResponseList {
+    override val mainPage = mainPageOf(
+        "" to "Latest",
+        "bollywood-movies" to "Bollywood",
+        "hollywood-movies" to "Hollywood",
+        "hindi-dubbed" to "Hindi Dubbed",
+        "south-hindi-movies" to "South Hindi",
+        "web-series" to "Web Series",
+    )
+
+    override suspend fun search(query: String, page: Int): SearchResponseList? {
         // WordPress search
         val url = "$mainUrl/?s=${query.trim().replace(" ", "+")}"
         val html = app.get(url, headers = browserHeaders).text
         return parseListing(html).toNewSearchResponseList()
-    }
-
-    override fun mainPageOf(): List<com.lagradost.cloudstream3.MainPageRequest> {
-        return mainPageOf(
-            "" to "Latest",
-            "bollywood-movies" to "Bollywood",
-            "hollywood-movies" to "Hollywood",
-            "hindi-dubbed" to "Hindi Dubbed",
-            "south-hindi-movies" to "South Hindi",
-            "web-series" to "Web Series",
-        )
     }
 
     override suspend fun load(url: String): LoadResponse? {

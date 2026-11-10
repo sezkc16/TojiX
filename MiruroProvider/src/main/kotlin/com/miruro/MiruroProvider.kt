@@ -386,6 +386,7 @@ class MiruroProvider : MainAPI() {
             episodes.add(newEpisode(dataJson) {
                 this.name = "Episode $n"
                 this.episode = n
+                this.posterUrl = poster
             })
         }
         return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {

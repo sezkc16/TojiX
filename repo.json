@@ -1,9 +1,10 @@
 {
     "name": "TojiX Repo",
+    "packageName": "com.toji.tojix",
     "iconUrl": "https://catimages.org/images/2026/05/05/cropped-KATDRAMA-fab.png",
     "description": "TojiX - KatDrama, HDHub4u, CineVood, HiCine, MoviesDrive, 4KHDHub, Movies4u, Vegamovies",
     "manifestVersion": 1,
     "pluginLists": [
-      "https://raw.githubusercontent.com/sezkc16/TojiX/builds/plugins.json"
+        "https://raw.githubusercontent.com/sezkc16/TojiX/builds/plugins.json"
     ]
 }

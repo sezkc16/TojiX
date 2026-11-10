@@ -290,7 +290,6 @@ class MiruroProvider : MainAPI() {
         val showStatus = when (m.status) {
             "RELEASING" -> ShowStatus.Ongoing
             "FINISHED" -> ShowStatus.Completed
-            "NOT_YET_RELEASED" -> ShowStatus.ComingSoon
             else -> null
         }
 
@@ -301,7 +300,6 @@ class MiruroProvider : MainAPI() {
                 this.plot = plot
                 this.year = m.seasonYear
                 this.tags = m.genres
-                this.showStatus = showStatus
             }
         }
 

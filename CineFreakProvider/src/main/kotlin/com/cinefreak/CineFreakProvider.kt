@@ -58,6 +58,8 @@ class CineFreakProvider : MainAPI() {
         @JsonProperty("url") val url: String? = null,
         @JsonProperty("vlc") val vlc: String? = null,
         @JsonProperty("state") val state: String? = null,
+        @JsonProperty("need") val need: String? = null,
+        @JsonProperty("message") val message: String? = null,
     )
 
     // ---- Search API models (/search-api.php) ----
@@ -299,25 +301,35 @@ class CineFreakProvider : MainAPI() {
         }
     }
 
-    // ---- CineCloud resolvers (all verified via plain HTTP) ----
-    // The Turnstile widget on CineCloud pages is NOT enforced server-side:
-    // /unlock and the a=play POST both return ok:true with an EMPTY token,
-    // so a provider can resolve every link without a browser.
+    // ---- CineCloud resolvers ----
+    // CineCloud's Turnstile check is INTERMITTENT (found 2026-11-10):
+    // most of the time /unlock and a=play accept an EMPTY token, but
+    // during enforcement windows they reject it (403 "Verification
+    // failed" / 401 "need ts") and NO provider can obtain a real
+    // Turnstile token — only a browser can. So loadLinks below runs in
+    // two passes: a fast first pass, and — only if it finds NOTHING —
+    // a delayed second pass, so a short enforcement blip does not
+    // zero out the whole list. A sustained enforcement window still
+    // cannot be beaten (same as Kartoons.to).
+    // Also: some download tokens go stale (410 "link has expired")
+    // while their sibling watch token still works, so watch is tried
+    // before download for the same quality.
 
     private fun cineHeaders(token: String): Map<String, String> {
         return browserHeaders + mapOf("Referer" to "https://cinecloud.top/f/$token")
     }
 
     // Download token -> server buttons -> 307 redirect -> direct R2 file.
-    // Tries server buttons in order until one resolves; all servers for
-    // one quality point at the same R2 file, so one resolved URL is enough.
+    // Single attempt (the caller retries at the loadLinks level).
+    // Prefers VISIBLE server buttons; the hidden .c5a7826 div holds
+    // duplicates (they also work, but are decoys).
     private suspend fun resolveDownloadToken(token: String): String? {
         // 1) "same browser" nonce
         val nonce: NonceResponse = try {
             app.get("https://cinecloud.top/f/$token/n", headers = cineHeaders(token)).parsed()
         } catch (e: Exception) { return null }
         val n = nonce.n ?: return null
-        // 2) unlock (empty Turnstile token works — not enforced server-side)
+        // 2) unlock (empty Turnstile token works when enforcement is off)
         val unlock: UnlockResponse = try {
             app.post(
                 "https://cinecloud.top/f/$token/unlock",
@@ -328,7 +340,9 @@ class CineFreakProvider : MainAPI() {
         if (unlock.ok != true) return null
         val html = unlock.html ?: return null
         val serverDoc = Jsoup.parse(html)
-        val serverHrefs = serverDoc.select("a[href^=/f/]")
+        val all = serverDoc.select("a[href^=/f/]")
+        val visible = all.filter { it.closest(".c5a7826") == null }
+        val serverHrefs = (if (visible.isNotEmpty()) visible else all)
             .map { it.attr("href") }
             .distinct()
         for (href in serverHrefs) {
@@ -348,6 +362,7 @@ class CineFreakProvider : MainAPI() {
     }
 
     // Watch token -> POST a=play -> JSON {ok, url} (direct R2 file).
+    // Single attempt (the caller retries at the loadLinks level).
     private suspend fun resolveWatchToken(token: String): String? {
         val play: PlayResponse = try {
             app.post(
@@ -368,27 +383,66 @@ class CineFreakProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val ep = tryParseJson<EpisodeData>(data) ?: return false
-        var found = false
         val seenUrls = mutableSetOf<String>()
-        ep.links?.forEach { entry ->
-            val direct = when (entry.host) {
-                "dl" -> resolveDownloadToken(entry.id)
-                "watch" -> resolveWatchToken(entry.id)
-                else -> null
-            } ?: return@forEach
-            if (!seenUrls.add(direct)) return@forEach
+        // One stream per quality label: prefer the Watch token (a=play
+        // is ONE call that returns the file URL directly), fall back to
+        // the Download token (n -> unlock -> server 307) for the same
+        // quality. This halves the request burst vs resolving every
+        // token, and a stale download token (410) no longer kills a
+        // quality whose watch token still works.
+        val groups = (ep.links ?: emptyList()).groupBy { it.label }
+
+        fun emit(label: String, quality: Int, url: String): Boolean {
+            if (!seenUrls.add(url)) return false
             callback(
                 newExtractorLink(
                     source = "CineFreak",
-                    name = "CineFreak ${entry.label}",
-                    url = direct,
+                    name = "CineFreak $label",
+                    url = url,
                     type = ExtractorLinkType.VIDEO
                 ) {
-                    this.quality = entry.quality
+                    this.quality = quality
                     this.referer = "https://cinecloud.top/"
                 }
             )
-            found = true
+            return true
+        }
+
+        // Resolves one quality group: watch token first (a=play is ONE
+        // call that returns the file URL directly), download token as
+        // fallback (n -> unlock -> server 307). Returns true if a
+        // stream was emitted for this group.
+        suspend fun resolveGroup(label: String, entries: List<LinkEntry>): Boolean {
+            val quality = entries.firstOrNull()?.quality ?: Qualities.Unknown.value
+            var direct: String? = null
+            for (entry in entries) {
+                if (entry.host != "watch") continue
+                direct = resolveWatchToken(entry.id)
+                if (direct != null) break
+            }
+            if (direct == null) {
+                for (entry in entries) {
+                    if (entry.host != "dl") continue
+                    direct = resolveDownloadToken(entry.id)
+                    if (direct != null) break
+                }
+            }
+            return if (direct != null) emit(label, quality, direct) else false
+        }
+
+        var found = false
+        // Pass 1 (fast): resolve every quality group.
+        for ((label, entries) in groups) {
+            if (resolveGroup(label, entries)) found = true
+        }
+        if (found) return true
+
+        // Pass 2 (only if pass 1 found NOTHING — e.g. a short
+        // Turnstile enforcement blip): wait, then resolve every group
+        // again with fresh nonces.
+        kotlinx.coroutines.delay(5000)
+        for ((label, entries) in groups) {
+            if (resolveGroup(label, entries)) found = true
         }
         return found
     }

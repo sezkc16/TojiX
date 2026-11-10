@@ -308,14 +308,14 @@ class ShuttleTVProvider : MainAPI() {
             .filterValues { it.url?.isNotBlank() == true }
             .toList()
             .sortedByDescending { (key, _) -> key.toIntOrNull() ?: 0 }
-        qualities.forEach { (qualityKey, quality) ->
-            val url = quality.url ?: return@forEach
+        qualities.forEach { (qualityKey, vidlinkQuality) ->
+            val url = vidlinkQuality.url ?: return@forEach
             val label = "${qualityKey}p"
             // The quality's own headers (e.g. referer/origin of the actual
             // file host) override the base Vidlink ones; drop any base key
             // that matches case-insensitively so no duplicate header is sent.
             val mergedHeaders = baseHeaders.toMutableMap()
-            quality.headers.orEmpty().forEach { (key, value) ->
+            vidlinkQuality.headers.orEmpty().forEach { (key, value) ->
                 mergedHeaders.keys
                     .filter { it.equals(key, ignoreCase = true) }
                     .forEach { mergedHeaders.remove(it) }

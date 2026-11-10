@@ -61,13 +61,23 @@ class HiCineProvider : MainAPI() {
         @JsonProperty("hasMore") val hasMore: Boolean? = null,
     )
 
+    // "Batch/Zip" season-pack download option. The API sends a list of
+    // OBJECTS here ({label, k}) — declaring it as List<String> made
+    // Jackson throw on any title with a non-empty zip list, which broke
+    // the whole title parse -> load() returned null ("HiCine returned
+    // nothing") for Naruto, Rings of Power, Crystal Lake, etc.
+    data class ZipItem(
+        @JsonProperty("label") val label: String? = null,
+        @JsonProperty("k") val k: String? = null,
+    )
+
     data class TitleGroup(
         @JsonProperty("head") val head: String? = null,
         @JsonProperty("season") val season: String? = null,
         @JsonProperty("quality") val quality: String? = null,
         @JsonProperty("size") val size: String? = null,
         @JsonProperty("k") val k: String? = null,
-        @JsonProperty("zip") val zip: List<String>? = null,
+        @JsonProperty("zip") val zip: List<ZipItem>? = null,
     )
 
     data class TitleMeta(

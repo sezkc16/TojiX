@@ -1,5 +1,6 @@
 package com.miruro
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.Episode
 import com.lagradost.cloudstream3.HomePageList
@@ -120,13 +121,16 @@ class MiruroProvider : MainAPI() {
 
     // ---- justanime models ----
 
+    @JsonIgnoreProperties(ignoreUnknown = true)
     data class JaSource(
         @JsonProperty("url") val url: String? = null,
         @JsonProperty("quality") val quality: String? = null,
         @JsonProperty("isM3U8") val isM3U8: Boolean? = null,
         @JsonProperty("headers") val headers: Map<String, String>? = null,
+        @JsonProperty("sig") val sig: String? = null,
     )
 
+    @JsonIgnoreProperties(ignoreUnknown = true)
     data class JaTrack(
         @JsonProperty("file") val file: String? = null,
         @JsonProperty("src") val src: String? = null,
@@ -135,19 +139,25 @@ class MiruroProvider : MainAPI() {
         @JsonProperty("kind") val kind: String? = null,
         @JsonProperty("default") val default: Boolean? = null,
         @JsonProperty("isDefault") val isDefault: Boolean? = null,
+        @JsonProperty("sig") val sig: String? = null,
     )
 
+    @JsonIgnoreProperties(ignoreUnknown = true)
     data class JaType(
         @JsonProperty("sources") val sources: List<JaSource>? = null,
         @JsonProperty("subtitles") val subtitles: List<JaTrack>? = null,
         @JsonProperty("tracks") val tracks: List<JaTrack>? = null,
         @JsonProperty("headers") val headers: Map<String, String>? = null,
+        @JsonProperty("intro") val intro: Any? = null,
+        @JsonProperty("outro") val outro: Any? = null,
     )
 
+    @JsonIgnoreProperties(ignoreUnknown = true)
     data class JaWatch(
         @JsonProperty("sub") val sub: JaType? = null,
         @JsonProperty("dub") val dub: JaType? = null,
         @JsonProperty("error") val error: String? = null,
+        @JsonProperty("exp") val exp: String? = null,
     )
 
     // Data passed to loadLinks.
@@ -218,7 +228,7 @@ class MiruroProvider : MainAPI() {
 
     private fun listQuery(sort: String): String {
         return "query(\$p:Int){Page(page:\$p,perPage:20){pageInfo{hasNextPage}" +
-            "media(sort:[$sort],type:ANIME,isAdult:false){id title{romaji english}coverImage{large}format}}}}"
+            "media(sort:[$sort],type:ANIME,isAdult:false){id title{romaji english}coverImage{large}format}}}"
     }
 
     override val mainPage = mainPageOf(
@@ -267,7 +277,7 @@ class MiruroProvider : MainAPI() {
     override suspend fun search(query: String, page: Int): SearchResponseList? {
         val res = anilist(
             "query(\$p:Int,\$n:Int,\$q:String){Page(page:\$p,perPage:\$n){pageInfo{hasNextPage}" +
-                "media(search:\$q,type:ANIME,isAdult:false){id title{romaji english}coverImage{large}format}}}}",
+                "media(search:\$q,type:ANIME,isAdult:false){id title{romaji english}coverImage{large}format}}}",
             mapOf("p" to page, "n" to 20, "q" to query.trim())
         ) ?: return null
         return (res.data?.Page?.media ?: emptyList())

@@ -25,6 +25,7 @@ import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.jsoup.Jsoup
 
@@ -348,7 +349,7 @@ class MultiMoviesProvider : MainAPI() {
         }
     }
 
-    private fun emitOrionStream(
+    private suspend fun emitOrionStream(
         stream: OrionStream,
         embedUrl: String,
         callback: (ExtractorLink) -> Unit,

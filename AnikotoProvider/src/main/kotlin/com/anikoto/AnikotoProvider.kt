@@ -187,7 +187,7 @@ class AnikotoProvider : MainAPI() {
     }
 
     /** Best-effort: read the master playlist's max height for an accurate quality label. */
-    private fun masterQuality(masterUrl: String): Int {
+    private suspend fun masterQuality(masterUrl: String): Int {
         return try {
             val text = app.get(masterUrl, headers = mapOf("User-Agent" to ua, "Referer" to megaReferer)).text
             val heights = Regex("RESOLUTION=\\d+x(\\d+)").findAll(text)
@@ -277,7 +277,6 @@ class AnikotoProvider : MainAPI() {
         var type = "TV"
         var year: Int? = null
         var status: ShowStatus? = null
-        var rating: Int? = null
         for (row in doc.select("div.bmeta div.meta > div")) {
             val label = row.ownText().trim()
             val value = row.selectFirst("span")?.text()?.trim().orEmpty()
@@ -293,10 +292,6 @@ class AnikotoProvider : MainAPI() {
                         rowText.contains("Currently", ignoreCase = true) -> ShowStatus.Ongoing
                         else -> null
                     }
-                }
-                label.startsWith("MAL:") -> {
-                    val score = Regex("(\\d+(\\.\\d+)?)").find(value)?.value?.toDoubleOrNull()
-                    if (score != null) rating = (score * 10).toInt()
                 }
             }
         }
@@ -332,7 +327,6 @@ class AnikotoProvider : MainAPI() {
                 this.plot = plot
                 this.year = year
                 this.tags = genres.ifEmpty { null }
-                if (rating != null) this.rating = rating
             }
         }
         return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
@@ -341,7 +335,6 @@ class AnikotoProvider : MainAPI() {
             this.year = year
             this.tags = genres.ifEmpty { null }
             this.showStatus = status
-            if (rating != null) this.rating = rating
         }
     }
 
@@ -373,6 +366,9 @@ class AnikotoProvider : MainAPI() {
                     val plain = decryptMegaplay(enc) ?: continue
                     val master = tryParseJson<MegaFile>(plain)?.file?.trim() ?: continue
                     if (master.isEmpty()) continue
+                    // Quality is read in suspend context BEFORE newExtractorLink —
+                    // the builder lambda must only assign plain values (Miruro pattern).
+                    val quality = masterQuality(master)
                     // Subtitles (best-effort: mysubsplay.com 403s from some networks).
                     try {
                         for (t in gs.tracks ?: emptyList()) {
@@ -392,7 +388,7 @@ class AnikotoProvider : MainAPI() {
                                 url = master,
                                 type = ExtractorLinkType.M3U8,
                             ) {
-                                this.quality = masterQuality(master)
+                                this.quality = quality
                                 this.referer = megaReferer
                                 this.headers = mapOf(
                                     "Referer" to megaReferer,

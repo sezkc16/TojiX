@@ -2,12 +2,15 @@ package com.anikoto
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.lagradost.cloudstream3.addDate
+import com.lagradost.cloudstream3.DubStatus
 import com.lagradost.cloudstream3.Episode
 import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
 import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.MainPageRequest
+import com.lagradost.cloudstream3.Score
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SearchResponseList
 import com.lagradost.cloudstream3.ShowStatus
@@ -15,11 +18,11 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.mainPageOf
+import com.lagradost.cloudstream3.newAnimeLoadResponse
 import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newMovieLoadResponse
 import com.lagradost.cloudstream3.newMovieSearchResponse
-import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 import com.lagradost.cloudstream3.newTvSeriesSearchResponse
 import com.lagradost.cloudstream3.toNewSearchResponseList
 import com.lagradost.cloudstream3.utils.ExtractorLink
@@ -31,6 +34,7 @@ import java.net.URLEncoder
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import org.json.JSONObject
 import org.jsoup.Jsoup
 
 /**
@@ -39,7 +43,23 @@ import org.jsoup.Jsoup
  * Server-rendered AniWatch-clone theme. Catalogue pages are plain HTML
  * (#list-items .item); the watch page IS the detail page (.binfo/.bmeta).
  *
- * Playback chain (verified end-to-end 2026-11-10, Black Clover ep 1):
+ * v2 (2026-11-10): episode list now matches the working Anikoto plugins:
+ *  - newAnimeLoadResponse + addEpisodes(DubStatus.Subbed/Dubbed) -> the
+ *    Sub/Dub toggle (the flat TvSeries list had none).
+ *  - Real episode titles / scores / synopses from Jikan (MAL id = data-mal
+ *    on the episode list; best-effort — falls back to "Episode N").
+ *  - Episode poster = anime poster (the site has no per-episode stills;
+ *    v1 left posterUrl unset -> broken-image placeholder).
+ *  - Episode date from the site's data-timestamp (unix; verified Oct 5/12/
+ *    19/26 2026 for Psyren), runTime from the page's Duration.
+ *  - loadLinks emits one link PER server (v1 stopped after the first
+ *    success, leaving a single fallback) + a fast path that builds the
+ *    megaplay embed straight from the catalog API's episode_embed_id
+ *    (anikotoapi.site/series/<id>), and links are named after the server
+ *    ("HD-1 [Sub]") so the source picker lists them all.
+ *
+ * Playback chain (verified end-to-end 2026-11-10, Black Clover ep 1 AND
+ * Psyren ep 1):
  *  1. GET /ajax/episode/list/<animeId> (X-Requested-With header) -> episode
  *     <a> items with data-id / data-num / data-ids (base64 token).
  *  2. GET /ajax/server/list?servers=<data-ids> -> server <li> items
@@ -95,6 +115,18 @@ class AnikotoProvider : MainAPI() {
     private val megaIvStr = "W0;27ToaUpl_P%'c"
     private val megaReferer = "https://megaplay.buzz/"
 
+    // anikoto's public catalog API — gives mal/ani ids + per-episode embed ids
+    // (direct megaplay URLs), so loadLinks has a fast path that skips the
+    // server-list round-trip. Verified 2026-11-10 (Psyren, animeId 9050).
+    private val apiBase = "https://anikotoapi.site"
+
+    // Jikan (MyAnimeList) — best-effort episode metadata. The site's own
+    // episode list only has "Episode N"; the real titles / scores / synopses
+    // (the ones the working plugins show) come from Jikan via the MAL id
+    // (data-mal on the episode list). If Jikan is unreachable the plugin
+    // falls back to the site data — this must never break load().
+    private val jikanBase = "https://api.jikan.moe/v4"
+
     // ---- JSON models ----
 
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -136,12 +168,40 @@ class AnikotoProvider : MainAPI() {
         @JsonProperty("file") val file: String? = null,
     )
 
-    // Data passed to loadLinks.
+    // Data passed to loadLinks. embed = episode_embed_id from anikotoapi.site
+    // (fast path); lang = "sub"/"dub" (the DubStatus the user tapped).
+    // Old v1 data ({ep, ids, url}) still parses: embed/lang default to null
+    // (lang -> "sub", fast path skipped).
     @JsonIgnoreProperties(ignoreUnknown = true)
     data class EpisodeData(
         @JsonProperty("ep") val ep: Int? = null,
         @JsonProperty("ids") val ids: String? = null,
         @JsonProperty("url") val url: String? = null,
+        @JsonProperty("embed") val embed: String? = null,
+        @JsonProperty("lang") val lang: String? = null,
+    )
+
+    // Jikan episode metadata (best-effort). Response:
+    // {"pagination":{"has_next_page":bool},"data":[{"mal_id":1,"title":"...",
+    // "aired":"2026-10-05T00:00:00+00:00","score":5.5,"synopsis":"..."}]}
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class JikanEp(
+        @JsonProperty("mal_id") val malId: Int? = null,
+        @JsonProperty("title") val title: String? = null,
+        @JsonProperty("aired") val aired: String? = null,
+        @JsonProperty("score") val score: Double? = null,
+        @JsonProperty("synopsis") val synopsis: String? = null,
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class JikanPagination(
+        @JsonProperty("has_next_page") val hasNextPage: Boolean? = null,
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class JikanEpResp(
+        @JsonProperty("data") val data: List<JikanEp>? = null,
+        @JsonProperty("pagination") val pagination: JikanPagination? = null,
     )
 
     private data class ServerEntry(val type: String, val name: String, val linkId: String)
@@ -197,6 +257,75 @@ class AnikotoProvider : MainAPI() {
         } catch (e: Exception) {
             Qualities.P1080.value
         }
+    }
+
+    /**
+     * Best-effort: anikotoapi.site series endpoint.
+     * Returns (malId, episode number -> episode_embed_id).
+     * Verified live (Psyren 9050: mal 63098, ep1 embed 203428, embed_url
+     * sub/dub megaplay URLs). Never throws — returns empty on any failure.
+     */
+    private suspend fun fetchApiSeries(animeId: String): Pair<String, Map<Int, String>> {
+        return try {
+            val res = app.get(
+                "$apiBase/series/$animeId",
+                headers = mapOf("User-Agent" to ua, "Accept" to "application/json"),
+            )
+            if (!res.isSuccessful) return "" to emptyMap()
+            val json = JSONObject(res.text)
+            if (!json.optBoolean("ok", false)) return "" to emptyMap()
+            val data = json.optJSONObject("data") ?: return "" to emptyMap()
+            val anime = data.optJSONObject("anime")
+            val malId = anime?.optString("mal_id").orEmpty()
+            val embedByNum = mutableMapOf<Int, String>()
+            val eps = data.optJSONArray("episodes")
+            if (eps != null) {
+                for (i in 0 until eps.length()) {
+                    val ep = eps.optJSONObject(i) ?: continue
+                    val num = ep.optInt("number", 0)
+                    val embedId = ep.optString("episode_embed_id").trim()
+                    if (num > 0 && embedId.isNotEmpty()) embedByNum[num] = embedId
+                }
+            }
+            malId to embedByNum
+        } catch (e: Exception) {
+            "" to emptyMap()
+        }
+    }
+
+    /**
+     * Best-effort: Jikan per-episode metadata (real titles, scores, synopses).
+     * Returns episode number -> JikanEp. Never throws — returns empty on any
+     * failure (Jikan unreachable / rate-limited / unknown MAL id).
+     * NOTE: Jikan is unreachable from this VM (verified 2026-11-10), so this
+     * enrichment is verified by code review only; on the phone it either
+     * fills in the real titles or no-ops and the site data is used.
+     */
+    private suspend fun fetchJikanEpisodes(malId: String): Map<Int, JikanEp> {
+        val out = mutableMapOf<Int, JikanEp>()
+        if (malId.isBlank()) return out
+        try {
+            var page = 1
+            while (page <= 3) {
+                val resp = try {
+                    app.get(
+                        "$jikanBase/anime/$malId/episodes?page=$page",
+                        headers = mapOf("User-Agent" to ua, "Accept" to "application/json"),
+                    ).parsed<JikanEpResp>()
+                } catch (e: Exception) {
+                    break
+                }
+                for (e in resp.data ?: emptyList()) {
+                    val n = e.malId ?: continue
+                    if (n > 0) out[n] = e
+                }
+                if (resp.pagination?.hasNextPage != true) break
+                page++
+            }
+        } catch (e: Exception) {
+            // Best-effort only.
+        }
+        return out
     }
 
     // ---- catalogue ----
@@ -277,6 +406,7 @@ class AnikotoProvider : MainAPI() {
         var type = "TV"
         var year: Int? = null
         var status: ShowStatus? = null
+        var durationMin: Int? = null
         for (row in doc.select("div.bmeta div.meta > div")) {
             val label = row.ownText().trim()
             val value = row.selectFirst("span")?.text()?.trim().orEmpty()
@@ -293,6 +423,9 @@ class AnikotoProvider : MainAPI() {
                         else -> null
                     }
                 }
+                label.startsWith("Duration:") -> {
+                    if (durationMin == null) durationMin = Regex("(\\d+)\\s*m").find(rowText)?.groupValues?.get(1)?.toIntOrNull()
+                }
             }
         }
         val genres = doc.select("div.bmeta a[href^=/genre/]").map { it.text().trim() }.filter { it.isNotEmpty() }
@@ -304,21 +437,80 @@ class AnikotoProvider : MainAPI() {
             null
         } ?: return null
         val epDoc = Jsoup.parse(epHtml)
-        val episodes = mutableListOf<Episode>()
-        var firstEpData: String? = null
+        // Site episode data: the <a> carries data-num / data-ids / data-dub /
+        // data-mal (MAL id) / data-timestamp (unix air date). It has NO real
+        // title / rating / description / poster — those come from Jikan below.
+        data class SiteEp(val num: Int, val ids: String, val ts: Long?, val hasDub: Boolean, val mal: String)
+        val siteEps = mutableListOf<SiteEp>()
         for (a in epDoc.select("a[data-id][data-num][data-ids]")) {
             val num = a.attr("data-num").toIntOrNull() ?: continue
             val ids = a.attr("data-ids").trim()
             if (ids.isEmpty()) continue
-            val dataJson = toJson(EpisodeData(ep = num, ids = ids, url = url)) ?: continue
-            if (firstEpData == null) firstEpData = dataJson
-            episodes.add(newEpisode(dataJson) {
-                this.name = "Episode $num"
-                this.episode = num
-            })
+            val ts = a.attr("data-timestamp").toLongOrNull()
+            val hasDub = a.attr("data-dub").trim() == "1"
+            val mal = a.attr("data-mal").trim()
+            siteEps.add(SiteEp(num, ids, ts, hasDub, mal))
         }
-        if (episodes.isEmpty()) return null
-        episodes.sortBy { it.episode }
+        if (siteEps.isEmpty()) return null
+        siteEps.sortBy { it.num }
+
+        // Fast-path embed ids + MAL id from the catalog API (best-effort).
+        val (apiMal, embedByNum) = fetchApiSeries(animeId)
+        val malId = siteEps.firstOrNull { it.mal.isNotEmpty() }?.mal ?: apiMal
+
+        // Real episode titles / scores / synopses from Jikan (best-effort).
+        val jikanByNum = fetchJikanEpisodes(malId)
+
+        val subEps = mutableListOf<Episode>()
+        val dubEps = mutableListOf<Episode>()
+        var firstEpData: String? = null
+        for (se in siteEps) {
+            val jk = jikanByNum[se.num]
+            // Real title from Jikan; the site only has "Episode N".
+            val epName = jk?.title?.trim()?.takeIf { it.isNotEmpty() } ?: "Episode ${se.num}"
+            val epScore = jk?.score?.let { Score.from10(it) }
+            val epDesc = jk?.synopsis?.trim()?.takeIf { it.isNotEmpty() }
+            // Air date: the site's data-timestamp (verified: 1791211001 ->
+            // Oct 5, 2026, matching the working plugin); Jikan `aired` fallback.
+            val tsMs = se.ts?.let { it * 1000L }
+            val embedId = embedByNum[se.num]
+            val subData = toJson(EpisodeData(ep = se.num, ids = se.ids, url = url, embed = embedId, lang = "sub")) ?: continue
+            if (firstEpData == null) firstEpData = subData
+            subEps.add(newEpisode(subData) {
+                this.name = epName
+                this.episode = se.num
+                this.season = 1
+                // The site has no per-episode stills; use the anime poster so
+                // the card is never the broken-image placeholder.
+                this.posterUrl = poster
+                this.score = epScore
+                this.description = epDesc
+                if (tsMs != null) {
+                    this.date = tsMs
+                } else {
+                    this.addDate(jk?.aired)
+                }
+                this.runTime = durationMin
+            })
+            if (se.hasDub) {
+                val dubData = toJson(EpisodeData(ep = se.num, ids = se.ids, url = url, embed = embedId, lang = "dub")) ?: continue
+                dubEps.add(newEpisode(dubData) {
+                    this.name = "$epName (Dub)"
+                    this.episode = se.num
+                    this.season = 1
+                    this.posterUrl = poster
+                    this.score = epScore
+                    this.description = epDesc
+                    if (tsMs != null) {
+                        this.date = tsMs
+                    } else {
+                        this.addDate(jk?.aired)
+                    }
+                    this.runTime = durationMin
+                })
+            }
+        }
+        if (subEps.isEmpty()) return null
 
         val isMovie = type.equals("Movie", ignoreCase = true)
         if (isMovie) {
@@ -327,23 +519,32 @@ class AnikotoProvider : MainAPI() {
                 this.plot = plot
                 this.year = year
                 this.tags = genres.ifEmpty { null }
+                this.duration = durationMin
             }
         }
-        return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
+        // AnimeLoadResponse + DubStatus gives the Sub/Dub toggle (the working
+        // plugin has it; the flat TvSeries list did not).
+        return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = poster
             this.plot = plot
             this.year = year
             this.tags = genres.ifEmpty { null }
             this.showStatus = status
+            this.duration = durationMin
+            addEpisodes(DubStatus.Subbed, subEps)
+            if (dubEps.isNotEmpty()) addEpisodes(DubStatus.Dubbed, dubEps)
         }
     }
 
     // ---- streams ----
 
-    /** Resolve one megaplay embed URL to its master.m3u8 and emit it. */
+    /** Resolve one megaplay embed URL to its master.m3u8 and emit it.
+     *  The link is named after the server ("HD-1 [Sub]") so the source
+     *  picker lists one entry per server, like the working plugin. */
     private suspend fun resolveMegaplay(
         embedUrl: String,
         watchUrl: String,
+        serverName: String,
         tag: String,
         callback: (ExtractorLink) -> Unit,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -384,7 +585,7 @@ class AnikotoProvider : MainAPI() {
                         callback(
                             newExtractorLink(
                                 source = "Anikoto",
-                                name = "MegaPlay [$tag]",
+                                name = "$serverName [$tag]",
                                 url = master,
                                 type = ExtractorLinkType.M3U8,
                             ) {
@@ -417,53 +618,73 @@ class AnikotoProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val ep = tryParseJson<EpisodeData>(data) ?: return false
-        val ids = ep.ids ?: return false
+        val ids = ep.ids
         val watchUrl = ep.url ?: mainUrl
+        val lang = (ep.lang ?: "sub").lowercase()
+        val embedId = ep.embed
         var found = false
-        try {
-            val srv = app.get(
-                "$mainUrl/ajax/server/list?servers=${URLEncoder.encode(ids, "UTF-8")}",
-                headers = ajaxHeaders(watchUrl),
-            ).parsed<AjaxResult>()
-            val srvDoc = Jsoup.parse(srv.result ?: return false)
-            val servers = mutableListOf<ServerEntry>()
-            for (typeDiv in srvDoc.select("div.type[data-type]")) {
-                val type = typeDiv.attr("data-type").trim().lowercase()
-                for (li in typeDiv.select("li[data-link-id]")) {
-                    val linkId = li.attr("data-link-id").trim()
-                    if (linkId.isEmpty()) continue
-                    servers.add(ServerEntry(type, li.text().trim(), linkId))
+        val seenEmbeds = mutableSetOf<String>()
+
+        // Fast path: direct megaplay embed from the catalog API's episode
+        // embed id (skips the server-list round-trip). Verified live (Psyren
+        // ep1: s-2/203428/sub -> same master as the HD-1 server).
+        if (!embedId.isNullOrBlank()) {
+            try {
+                val fastEmbed = "https://megaplay.buzz/stream/s-2/$embedId/$lang"
+                if (seenEmbeds.add(fastEmbed)) {
+                    if (resolveMegaplay(fastEmbed, watchUrl, "MegaPlay", if (lang == "dub") "Dub" else "Sub", callback, subtitleCallback)) {
+                        found = true
+                    }
                 }
+            } catch (e: Exception) {
+                // Fall through to the site server list.
             }
-            // One server per audio type is enough (all point at the same file);
-            // try the servers of each type in order until one resolves.
-            val seenEmbeds = mutableSetOf<String>()
-            for (wantType in listOf("sub", "dub")) {
-                val typed = servers.filter { it.type == wantType }
-                for (server in typed) {
+        }
+
+        // Site server list — try EVERY server and emit one link per server
+        // (the working plugin lists ~16 sources; v1 stopped after the first
+        // success, leaving the player with a single fallback).
+        if (!ids.isNullOrBlank()) {
+            try {
+                val srv = app.get(
+                    "$mainUrl/ajax/server/list?servers=${URLEncoder.encode(ids, "UTF-8")}",
+                    headers = ajaxHeaders(watchUrl),
+                ).parsed<AjaxResult>()
+                val srvDoc = Jsoup.parse(srv.result ?: "")
+                val servers = mutableListOf<ServerEntry>()
+                for (typeDiv in srvDoc.select("div.type[data-type]")) {
+                    val type = typeDiv.attr("data-type").trim().lowercase()
+                    for (li in typeDiv.select("li[data-link-id]")) {
+                        val linkId = li.attr("data-link-id").trim()
+                        if (linkId.isEmpty()) continue
+                        servers.add(ServerEntry(type, li.text().trim(), linkId))
+                    }
+                }
+                // Requested audio first, then the other audio as fallback.
+                val ordered = servers.filter { it.type == lang } + servers.filter { it.type != lang }
+                for (server in ordered) {
                     try {
                         val got = app.get(
                             "$mainUrl/ajax/server?get=${URLEncoder.encode(server.linkId, "UTF-8")}",
                             headers = ajaxHeaders(watchUrl),
                         ).parsed<ServerGetResp>()
                         val embedUrl = got.result?.url?.trim() ?: continue
-                        if (!seenEmbeds.add(embedUrl)) continue
-                        val tag = if (wantType == "dub") "Dub" else "Sub"
+                        if (embedUrl.isEmpty() || !seenEmbeds.add(embedUrl)) continue
+                        val tag = if (server.type == "dub") "Dub" else "Sub"
                         try {
-                            if (resolveMegaplay(embedUrl, watchUrl, tag, callback, subtitleCallback)) {
+                            if (resolveMegaplay(embedUrl, watchUrl, server.name.ifEmpty { "Server" }, tag, callback, subtitleCallback)) {
                                 found = true
                             }
                         } catch (e: Exception) {
                             // This server failed — try the next one.
                         }
-                        if (found) break
                     } catch (e: Exception) {
                         continue
                     }
                 }
+            } catch (e: Exception) {
+                // loadLinks must not throw.
             }
-        } catch (e: Exception) {
-            // loadLinks must not throw.
         }
         return found
     }

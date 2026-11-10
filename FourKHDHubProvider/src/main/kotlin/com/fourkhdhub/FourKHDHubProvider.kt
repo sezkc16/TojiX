@@ -212,6 +212,7 @@ class FourKHDHubProvider : MainAPI() {
                     this.name = "Episode $epNum"
                     this.episode = epNum
                     this.season = seasonNum
+                    this.posterUrl = poster
                 })
             }
             // Season packs (div.download-item outside .episodes-list) as
@@ -249,6 +250,7 @@ class FourKHDHubProvider : MainAPI() {
                     this.name = "Season $seasonNum Pack ($label)".trim()
                     this.episode = 0
                     this.season = seasonNum
+                    this.posterUrl = poster
                 })
             }
             if (episodes.isEmpty()) return null

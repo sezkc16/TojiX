@@ -1,8 +1,8 @@
 // Use an integer for version numbers
-version = 1
+version = 2
 
 cloudstream {
-    description = "Movies & TV Shows from ShuttleTV (TMDB catalog + Videasy, Vidlink, VidFast, Xpass, Stremio, DahmerMovies, ProjectFreeTv, Autoembed)"
+    description = "Movies & TV Shows from ShuttleTV (TMDB catalog + Videasy, Vidlink, VidFast, Xpass, Stremio, ProjectFreeTv, Autoembed)"
     authors = listOf("Toji")
 
     /**

@@ -25,7 +25,6 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import org.jsoup.Jsoup
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 
@@ -36,7 +35,7 @@ import java.nio.charset.StandardCharsets
 // CloudStream provider can use it. This module therefore works the same way
 // as the community ShuttleTV module: TMDB v3 for catalog / search / detail,
 // and third-party stream extractors (Videasy, Vidlink, VidFast, Xpass,
-// Stremio addons, DahmerMovies, ProjectFreeTv, Autoembed) for playback.
+// Stremio addons, ProjectFreeTv, Autoembed) for playback.
 // Streams do NOT come from ShuttleTV itself.
 class ShuttleTVProvider : MainAPI() {
 
@@ -201,7 +200,6 @@ class ShuttleTVProvider : MainAPI() {
         if (invokeVidlink(streamData, callback)) found = true
         if (invokeXpass(streamData, callback)) found = true
         if (invokeStremioHttps(streamData, subtitleCallback, callback)) found = true
-        if (invokeDahmerMovies(streamData, callback)) found = true
         if (invokeAutoembed(streamData, subtitleCallback, callback)) found = true
         if (invokeProjectFreeTv(streamData, subtitleCallback, callback)) found = true
         if (!found && invokeVidFastPro(streamData, subtitleCallback, callback)) found = true
@@ -269,7 +267,10 @@ class ShuttleTVProvider : MainAPI() {
 
     // ---- Vidlink ----
     // GET enc-dec.app/api/enc-vidlink?text=<tmdbId> -> {result: <encoded id>}
-    // GET vidlink.pro/api/b/movie|tv/<encoded>[/<season>/<episode>] -> {stream: {playlist}}
+    // GET vidlink.pro/api/b/movie|tv/<encoded>[/<season>/<episode>] ->
+    //   {stream: {qualities: {"1080": {url, type, headers, requiresProxy}, ...}, captions}}
+    // (The API used to return a single stream.playlist URL; that field no
+    // longer exists, so the legacy shape is only kept as a fallback.)
     private suspend fun invokeVidlink(
         data: TmdbStreamData,
         callback: (ExtractorLink) -> Unit,
@@ -281,7 +282,7 @@ class ShuttleTVProvider : MainAPI() {
                 ?.result
         }.getOrNull() ?: return false
 
-        val headers = mapOf(
+        val baseHeaders = mapOf(
             "User-Agent" to chromeUa,
             "Connection" to "keep-alive",
             "Referer" to "$vidlinkApi/",
@@ -294,26 +295,64 @@ class ShuttleTVProvider : MainAPI() {
             "$vidlinkApi/api/b/tv/$encodedId/${data.season}/${data.episode.orEmpty()}"
         }
 
-        val playlist = runCatching {
-            app.get(streamUrl, headers = headers)
+        val stream = runCatching {
+            app.get(streamUrl, headers = baseHeaders)
                 .parsed<VidlinkResponse>()
                 ?.stream
-                ?.playlist
-        }.getOrNull()?.takeIf { it.isNotBlank() } ?: return false
+        }.getOrNull() ?: return false
 
-        callback(
-            newExtractorLink(
-                source = "ShuttleTV Vidlink",
-                name = "ShuttleTV Vidlink",
-                url = playlist,
-                type = playlist.toExtractorType()
-            ) {
-                quality = Qualities.Unknown.value
-                this.headers = headers
+        var found = false
+
+        // New API shape: one direct URL per quality, highest first.
+        val qualities = stream.qualities.orEmpty()
+            .filterValues { it.url?.isNotBlank() == true }
+            .toList()
+            .sortedByDescending { (key, _) -> key.toIntOrNull() ?: 0 }
+        qualities.forEach { (qualityKey, quality) ->
+            val url = quality.url ?: return@forEach
+            val label = "${qualityKey}p"
+            // The quality's own headers (e.g. referer/origin of the actual
+            // file host) override the base Vidlink ones; drop any base key
+            // that matches case-insensitively so no duplicate header is sent.
+            val mergedHeaders = baseHeaders.toMutableMap()
+            quality.headers.orEmpty().forEach { (key, value) ->
+                mergedHeaders.keys
+                    .filter { it.equals(key, ignoreCase = true) }
+                    .forEach { mergedHeaders.remove(it) }
+                mergedHeaders[key] = value
             }
-        )
+            callback(
+                newExtractorLink(
+                    source = "ShuttleTV Vidlink",
+                    name = "ShuttleTV Vidlink $label",
+                    url = url,
+                    type = url.toExtractorType()
+                ) {
+                    quality = qualityValue(label)
+                    this.headers = mergedHeaders
+                }
+            )
+            found = true
+        }
 
-        return true
+        // Legacy shape fallback: a single playlist URL.
+        if (!found) {
+            val playlist = stream.playlist?.takeIf { it.isNotBlank() } ?: return false
+            callback(
+                newExtractorLink(
+                    source = "ShuttleTV Vidlink",
+                    name = "ShuttleTV Vidlink",
+                    url = playlist,
+                    type = playlist.toExtractorType()
+                ) {
+                    quality = Qualities.Unknown.value
+                    this.headers = baseHeaders
+                }
+            )
+            found = true
+        }
+
+        return found
     }
 
     // ---- VidFast ----
@@ -545,75 +584,6 @@ class ShuttleTVProvider : MainAPI() {
         return found
     }
 
-    // ---- DahmerMovies (directory listing) ----
-    // GET a.111477.xyz/movies/<Title> (<Year>)/  or  /tvs/<Title>/Season <N>/
-    // and pick direct video file links from the <a> tags.
-    private suspend fun invokeDahmerMovies(
-        data: TmdbStreamData,
-        callback: (ExtractorLink) -> Unit,
-    ): Boolean {
-        val title = data.title?.takeIf { it.isNotBlank() } ?: return false
-        val cleanTitle = title.replace(":", "").trim()
-        val pageUrl = if (data.season == null) {
-            val folder = if (data.year == null) cleanTitle else "$cleanTitle (${data.year})"
-            "$dahmerMoviesApi/movies/${folder.urlEncode()}/"
-        } else {
-            "$dahmerMoviesApi/tvs/${cleanTitle.replace(":", " -").urlEncode()}/Season%20${data.season}/"
-        }
-
-        val links = runCatching {
-            val html = app.get(pageUrl).text
-            Jsoup.parse(html)
-                .select("a")
-                .mapNotNull { anchor ->
-                    val label = anchor.text().trim()
-                    val href = anchor.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                    label to href.toDahmerUrl()
-                }
-        }.getOrDefault(emptyList())
-
-        val episodePattern = if (data.season != null && data.episode != null) {
-            Regex("S0?${data.season}E0?${data.episode}", RegexOption.IGNORE_CASE)
-        } else {
-            null
-        }
-        val headers = mapOf(
-            "User-Agent" to chromeUa,
-            "Referer" to "$dahmerMoviesApi/",
-            "Range" to "bytes=0-",
-        )
-
-        var found = false
-        links
-            .asSequence()
-            .filter { (label, url) ->
-                url.hasDirectVideoExtension() &&
-                    if (episodePattern == null) {
-                        label.contains(Regex("(?i)(720p|1080p|2160p|4k|remux|bluray|web)"))
-                    } else {
-                        episodePattern.containsMatchIn(label)
-                    }
-            }
-            .distinctBy { it.second }
-            .take(24)
-            .forEach { (label, url) ->
-                callback(
-                    newExtractorLink(
-                        source = "ShuttleTV DahmerMovies",
-                        name = "ShuttleTV DahmerMovies $label".trim(),
-                        url = url,
-                        type = url.toExtractorType()
-                    ) {
-                        this.headers = headers
-                        quality = qualityValue(label)
-                    }
-                )
-                found = true
-            }
-
-        return found
-    }
-
     // ---- ProjectFreeTv ----
     // GET projectfreetv.sx/data/browse/?...&keyword=<title>&year=<year> -> {_id}
     // GET projectfreetv.sx/data/watch/?_id=<id> -> streams; each via loadExtractor.
@@ -829,21 +799,6 @@ class ShuttleTVProvider : MainAPI() {
         }
     }
 
-    private fun String.hasDirectVideoExtension(): Boolean {
-        val cleanUrl = substringBefore("?").lowercase()
-        return cleanUrl.endsWith(".mp4") ||
-            cleanUrl.endsWith(".mkv") ||
-            cleanUrl.endsWith(".m3u8")
-    }
-
-    private fun String.toDahmerUrl(): String {
-        return when {
-            startsWith("http", true) -> this
-            startsWith("/") -> "$dahmerMoviesApi$this"
-            else -> "$dahmerMoviesApi/$this"
-        }
-    }
-
     private fun String.videoHeaders(): Map<String, String> {
         val headers = streamHeaders.toMutableMap()
         when {
@@ -958,7 +913,15 @@ class ShuttleTVProvider : MainAPI() {
     )
 
     data class VidlinkStream(
+        @JsonProperty("qualities") val qualities: Map<String, VidlinkQuality>? = null,
         @JsonProperty("playlist") val playlist: String? = null,
+    )
+
+    data class VidlinkQuality(
+        @JsonProperty("url") val url: String? = null,
+        @JsonProperty("type") val type: String? = null,
+        @JsonProperty("requiresProxy") val requiresProxy: Boolean? = null,
+        @JsonProperty("headers") val headers: Map<String, String>? = null,
     )
 
     data class VidFastDecodeResponse(
@@ -1069,7 +1032,6 @@ class ShuttleTVProvider : MainAPI() {
         private const val autoembedApi = "https://player.autoembed.app"
         private const val xpassApi = "https://play.xpass.top"
         private const val projectFreeTvApi = "https://projectfreetv.sx"
-        private const val dahmerMoviesApi = "https://a.111477.xyz"
         private const val decryptApi = "https://enc-dec.app/api"
         private val stremioHttpsAddons = listOf(
             "Streamvix" to "https://streamvix.hayd.uk",

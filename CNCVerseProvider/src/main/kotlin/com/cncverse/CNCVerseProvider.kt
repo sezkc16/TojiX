@@ -17,7 +17,7 @@ import com.lagradost.cloudstream3.utils.AppUtils
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.SubtitleFile
+import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
@@ -56,7 +56,7 @@ class CNCVerseProvider : MainAPI() {
     /** OTT code sent to the catalogue cookies and the NewTV API. */
     private val ott = "nf"
 
-    /** WebView-style headers for the catalogue (mobile/*) calls. */
+    /** WebView-style headers for the catalogue (mobile endpoints). */
     private val headers = mapOf(
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         "Accept-Language" to "en-IN,en-US;q=0.9,en;q=0.8",

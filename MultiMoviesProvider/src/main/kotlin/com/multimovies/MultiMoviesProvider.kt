@@ -274,25 +274,38 @@ class MultiMoviesProvider : MainAPI() {
             return false
         }
         val doc = Jsoup.parse(html)
-        // Server buttons: <button class="server-chip" data-url="...">.
+        // Server buttons: <button class="server-chip" data-url="...">Label</button>.
         // Jsoup unescapes &amp; in the attribute automatically.
-        val serverUrls = mutableListOf<String>()
+        val servers = mutableListOf<Pair<String, String>>()
         val seen = mutableSetOf<String>()
         for (btn in doc.select("button.server-chip")) {
             val u = btn.attr("data-url").trim()
             if (u.isEmpty() || !seen.add(u)) continue
-            serverUrls.add(u)
+            val label = btn.text().trim().takeIf { it.isNotBlank() } ?: "MultiMovies"
+            servers.add(u to label)
         }
-        if (serverUrls.isEmpty()) return false
+        if (servers.isEmpty()) return false
 
         var found = false
         val isTv = linkData.season != null && linkData.episode != null
 
-        // Vidrift first (verified direct mp4s), then Filmu (verified HLS),
-        // then everything else via loadExtractor (best effort).
-        for (u in serverUrls) {
+        // v4: Phisher-style per-host dispatch. Our v3 only resolved
+        // Vidrift + Filmu (both blocked from the user's phone) and sent
+        // everything else to loadExtractor, which has no extractor for
+        // modiplay / vidout / iqsmartgames — so no link was ever emitted.
+        // Phisher's resolves modiplay (Cineverse) + vidout, which is
+        // where the working streams live (vidhide CDN via EarnVids, and
+        // the Watchout2025 GitHub API for vidout).
+        for ((u, label) in servers) {
             try {
+                val host = hostOf(u)
                 when {
+                    host.contains("modiplay") -> {
+                        if (resolveModiplay(u, label, subtitleCallback, callback)) found = true
+                    }
+                    host.contains("vidout") -> {
+                        if (resolveVidout(u, label, subtitleCallback, callback)) found = true
+                    }
                     u.contains("vidrift.net") -> {
                         if (resolveVidrift(u, isTv, subtitleCallback, callback)) found = true
                     }
@@ -304,12 +317,403 @@ class MultiMoviesProvider : MainAPI() {
                 // one dead server must not kill the rest
             }
         }
-        for (u in serverUrls) {
-            if (u.contains("vidrift.net") || u.contains("filmu.in") || u.contains("vidly.pro")) continue
+        // Fallback: everything not handled above via loadExtractor, then
+        // by scraping .m3u8/.mp4 links out of the embed HTML.
+        for ((u, label) in servers) {
+            val host = hostOf(u)
+            if (host.contains("modiplay") || host.contains("vidout") ||
+                u.contains("vidrift.net") || u.contains("filmu.in") || u.contains("vidly.pro")
+            ) continue
             try {
-                if (loadExtractor(u, subtitleCallback, callback)) found = true
+                if (loadExtractor(u, subtitleCallback, callback)) {
+                    found = true
+                    continue
+                }
             } catch (e: Exception) {
-                // best effort — one dead server must not kill the rest
+                // fall through to the HTML scrape
+            }
+            try {
+                val embedHtml = app.get(u, headers = browserHeaders + mapOf("Referer" to "$mainUrl/")).text
+                if (extractM3u8Links(embedHtml, u, label, callback)) found = true
+            } catch (e: Exception) {
+                // best effort
+            }
+        }
+        return found
+    }
+
+    // ---- v4: Phisher-style resolution (modiplay + vidout) ----
+
+    private fun hostOf(url: String): String {
+        return try {
+            java.net.URI(url).host?.lowercase() ?: ""
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    private fun originOf(url: String): String {
+        return try {
+            val u = java.net.URI(url)
+            "${u.scheme}://${u.host}"
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    private fun absUrl(base: String, url: String): String {
+        val u = url.trim()
+        if (u.startsWith("http://") || u.startsWith("https://")) return u
+        val b = base.trimEnd('/')
+        return if (u.startsWith("/")) "$b$u" else "$b/$u"
+    }
+
+    // Unescape a URL found in JS/HTML: \/ -> /, \" -> ", &amp; -> &.
+    private fun deEsc(s: String): String {
+        return s.replace("\\/", "/").replace("\\\"", "\"").replace("&amp;", "&")
+    }
+
+    private fun qualityFromName(name: String): Int {
+        return when {
+            name.contains("2160", ignoreCase = true) || name.contains("4k", ignoreCase = true) -> Qualities.P2160.value
+            name.contains("1080", ignoreCase = true) -> Qualities.P1080.value
+            name.contains("720", ignoreCase = true) -> Qualities.P720.value
+            name.contains("480", ignoreCase = true) -> Qualities.P480.value
+            name.contains("360", ignoreCase = true) -> Qualities.P360.value
+            else -> Qualities.Unknown.value
+        }
+    }
+
+    // Dean Edwards JS packer unpacker (port of Phisher's JsPacker).
+    // The modiplay sub-embeds (EarnVids etc.) pack their stream URLs in
+    // eval(function(p,a,c,k,e,d){...}('payload',36,528,'k1|k2|...'.split('|'))).
+    private object JsPacker {
+        private const val CHARS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+        private fun baseN(num: Int, base: Int): String {
+            if (num == 0) return "0"
+            var temp = num
+            val sb = StringBuilder()
+            while (temp > 0) {
+                sb.append(CHARS[temp % base])
+                temp /= base
+            }
+            return sb.reverse().toString()
+        }
+
+        fun unpack(p: String, a: Int, c: Int, k: List<String>): String {
+            var payload = p
+            for (i in c - 1 downTo 0) {
+                if (i < k.size && k[i].isNotEmpty()) {
+                    payload = Regex("\\b" + Regex.escape(baseN(i, a)) + "\\b")
+                        .replace(payload) { k[i] }
+                }
+            }
+            return payload
+        }
+
+        // Find the packed eval(...) in `html` and unpack it. Returns null
+        // when there is no packed JS.
+        fun parseAndUnpack(html: String): String? {
+            var startIdx = html.indexOf("eval(function(p,a,c,k,e,d)")
+            if (startIdx == -1) startIdx = html.indexOf("function(p,a,c,k,e,d)")
+            if (startIdx == -1) return null
+            val openBraceIdx = html.indexOf("{", startIdx)
+            if (openBraceIdx == -1) return null
+            var braceCount = 1
+            var j = openBraceIdx + 1
+            while (j < html.length && braceCount > 0) {
+                if (html[j] == '{') braceCount++
+                else if (html[j] == '}') braceCount--
+                j++
+            }
+            val argsStartIdx = html.indexOf("(", j - 1)
+            if (argsStartIdx == -1) return null
+            var argsParenCount = 1
+            var kIdx = argsStartIdx + 1
+            while (kIdx < html.length && argsParenCount > 0) {
+                if (html[kIdx] == '(') argsParenCount++
+                else if (html[kIdx] == ')') argsParenCount--
+                kIdx++
+            }
+            val argsStr = html.substring(argsStartIdx + 1, kIdx - 1).trim()
+            if (argsStr.isEmpty()) return null
+            val startChar = argsStr[0]
+            val payload = StringBuilder()
+            var i = 1
+            while (i < argsStr.length) {
+                if (argsStr[i] == startChar) {
+                    // An even backslash count means this quote is NOT
+                    // escaped, so the payload ends here.
+                    var backslashCount = 0
+                    var m = i - 1
+                    while (m >= 0 && argsStr[m] == '\\') {
+                        backslashCount++
+                        m--
+                    }
+                    if (backslashCount % 2 == 0) break
+                }
+                payload.append(argsStr[i])
+                i++
+            }
+            val unescapedPayload = payload.toString()
+                .replace("\\" + startChar, startChar.toString())
+                .replace("\\\\", "\\")
+            val rest = argsStr.substring(i + 1)
+            val restQuoteMatch = Regex("[\"']").find(rest) ?: return null
+            val quotePos = restQuoteMatch.range.first
+            val restQuoteChar = restQuoteMatch.value
+            val ints = Regex("\\b\\d+\\b").findAll(rest.substring(0, quotePos))
+                .map { it.value.toIntOrNull() ?: 0 }.toList()
+            if (ints.size < 2) return null
+            val a = ints[0]
+            val c = ints[1]
+            val keysStr = StringBuilder()
+            var jj = quotePos + 1
+            while (jj < rest.length) {
+                if (rest[jj].toString() == restQuoteChar) {
+                    var backslashCount2 = 0
+                    var b = jj - 1
+                    while (b >= 0 && rest[b] == '\\') {
+                        backslashCount2++
+                        b--
+                    }
+                    if (backslashCount2 % 2 == 0) break
+                }
+                keysStr.append(rest[jj])
+                jj++
+            }
+            val keys = keysStr.toString()
+                .replace("\\" + restQuoteChar, restQuoteChar)
+                .replace("\\\\", "\\")
+                .split("|")
+            return unpack(unescapedPayload, a, c, keys)
+        }
+    }
+
+    // Resolve ONE modiplay sub-embed (EarnVids, StreamHG, ...) by
+    // unpacking its packed JS and emitting the hls2/hls3/hls4 masters.
+    // Returns true if at least one link was emitted.
+    private suspend fun resolvePackerEmbed(
+        embedUrl: String,
+        label: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+        referer: String,
+    ): Boolean {
+        return try {
+            val resp = try {
+                app.get(embedUrl, headers = browserHeaders + mapOf("Referer" to referer))
+            } catch (e: Exception) {
+                return false
+            }
+            val html = resp.text
+            // The embed may redirect (minochinos.com -> callistanise.com);
+            // the stream's Referer must be the FINAL page's origin.
+            val base = originOf(resp.url)
+            if (base.isBlank()) return false
+            val unpacked = JsPacker.parseAndUnpack(html) ?: return false
+            val hls = listOf(
+                Regex("\"hls2\"\\s*:\\s*\"([^\"]+)\"").find(unpacked)?.groupValues?.getOrNull(1),
+                Regex("\"hls3\"\\s*:\\s*\"([^\"]+)\"").find(unpacked)?.groupValues?.getOrNull(1),
+                Regex("\"hls4\"\\s*:\\s*\"([^\"]+)\"").find(unpacked)?.groupValues?.getOrNull(1),
+            ).mapNotNull { it?.takeIf { v -> v.isNotBlank() }?.let { v -> deEsc(v) } }
+                .map { if (it.startsWith("http")) it else absUrl(base, it) }
+                .distinct()
+            var found = false
+            for (master in hls) {
+                try {
+                    callback(
+                        newExtractorLink(
+                            source = "MultiMovies",
+                            name = label,
+                            url = master,
+                            type = ExtractorLinkType.M3U8,
+                        ) {
+                            this.quality = qualityFromName(label)
+                            this.referer = base
+                            this.headers = playbackHeaders(base)
+                        }
+                    )
+                    found = true
+                } catch (e: Exception) {
+                    // one bad hls must not kill the rest
+                }
+            }
+            // Subtitles: file: "https://..._eng.vtt" in the unpacked JS.
+            try {
+                val seen = mutableSetOf<String>()
+                for (m in Regex("file\\s*:\\s*\"(https?[^\"]+\\.vtt)\"").findAll(unpacked)) {
+                    val url = deEsc(m.groupValues[1])
+                    if (!seen.add(url)) continue
+                    val lang = url.substringAfterLast('_', "").substringBefore('.', "")
+                        .takeIf { it.isNotBlank() }?.uppercase() ?: "Subtitle"
+                    subtitleCallback(SubtitleFile(lang, url))
+                }
+            } catch (e: Exception) {
+                // subtitles are optional
+            }
+            found
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    // Modiplay (Cineverse) embed: https://<host>.modiplay.xyz/embed/tmdb/...
+    // The page lists its sub-servers as <div class="srv-item">
+    // data-url / data-platform / data-pname / data-code. Each sub-embed
+    // is resolved via the packer (EarnVids etc. carry the real stream).
+    // NOTE: Phisher extracts the servers with a switchServer('...')
+    // regex, but the live page uses data-* attributes +
+    // switchServerFromEl(this) — that regex matches nothing today, so we
+    // read the data-* attributes instead.
+    private suspend fun resolveModiplay(
+        embedUrl: String,
+        label: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        return try {
+            val html = try {
+                app.get(embedUrl, headers = browserHeaders + mapOf("Referer" to "$mainUrl/")).text
+            } catch (e: Exception) {
+                return false
+            }
+            val servers = Regex(
+                "data-url=\"([^\"]+)\"[^>]*?data-platform=\"([^\"]+)\"[^>]*?data-pname=\"([^\"]+)\"[^>]*?data-code=\"([^\"]+)\""
+            ).findAll(html).map { m ->
+                // (embed, platform, name, code)
+                listOf(m.groupValues[1], m.groupValues[2], m.groupValues[3], m.groupValues[4])
+            }.distinctBy { it[3] }.toList()
+            var found = false
+            for (srv in servers) {
+                val subEmbed = srv[0].trim()
+                val subLabel = srv[2].trim().takeIf { it.isNotBlank() } ?: label
+                if (subEmbed.isBlank()) continue
+                // Filemoon gives only a code (not a URL) and Bingr a
+                // relative proxy.php — the packer cannot fetch those.
+                if (!subEmbed.startsWith("http")) continue
+                try {
+                    if (resolvePackerEmbed(subEmbed, subLabel, subtitleCallback, callback, embedUrl)) {
+                        found = true
+                    }
+                } catch (e: Exception) {
+                    // one dead sub-server must not kill the rest
+                }
+            }
+            found
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    // Vidout embed: https://vidout.pages.dev/movie/<id> or
+    // /tv/<tmdb>/s<S>/e<E>. The stream comes from a public GitHub API
+    // (Watchout2025/api) — no JS, no packer. Falls back to letting
+    // CloudStream's extractors try the vidy.st page.
+    private suspend fun resolveVidout(
+        embedUrl: String,
+        label: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        val vidoutReferer = "https://vidout.pages.dev/"
+        return try {
+            val tvMatch = Regex("""/tv/(\d+)/(?:s(\d+)|(\d+))/(?:e(\d+)|(\d+))""", RegexOption.IGNORE_CASE).find(embedUrl)
+            val movieMatch = if (tvMatch == null) {
+                Regex("""/movie/(tt\d+|\d+)""", RegexOption.IGNORE_CASE).find(embedUrl)
+            } else null
+            var streamUrl: String? = null
+            var fallback: String? = null
+            if (tvMatch != null) {
+                val tmdbId = tvMatch.groupValues[1]
+                val season = tvMatch.groupValues[2].ifEmpty { tvMatch.groupValues[3] }.toIntOrNull() ?: 1
+                val episode = tvMatch.groupValues[4].ifEmpty { tvMatch.groupValues[5] }.toIntOrNull() ?: 1
+                fallback = "https://vidy.st/tv/$tmdbId/$season/$episode"
+                try {
+                    val apiUrl = "https://raw.githubusercontent.com/Watchout2025/api/refs/heads/main/hls/tv/$tmdbId/S$season.json"
+                    val body = app.get(apiUrl, headers = browserHeaders).text
+                    streamUrl = Regex("\"" + episode + "\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
+                } catch (e: Exception) {
+                    streamUrl = null
+                }
+            } else if (movieMatch != null) {
+                val id = movieMatch.groupValues[1]
+                fallback = "https://vidy.st/movie/$id"
+                try {
+                    val apiUrl = "https://raw.githubusercontent.com/Watchout2025/api/refs/heads/main/hls/movie/$id"
+                    val body = app.get(apiUrl, headers = browserHeaders).text.trim()
+                    streamUrl = if (body.startsWith("http")) body else null
+                } catch (e: Exception) {
+                    streamUrl = null
+                }
+            } else {
+                return false
+            }
+            if (streamUrl != null) {
+                try {
+                    callback(
+                        newExtractorLink(
+                            source = "MultiMovies",
+                            name = label,
+                            url = streamUrl,
+                            type = ExtractorLinkType.M3U8,
+                        ) {
+                            this.quality = Qualities.Unknown.value
+                            this.referer = vidoutReferer
+                            this.headers = playbackHeaders(vidoutReferer)
+                        }
+                    )
+                    return true
+                } catch (e: Exception) {
+                    // fall through to the vidy.st fallback
+                }
+            }
+            // Fallback: let CloudStream's extractors try the vidy.st page.
+            if (fallback != null) {
+                try {
+                    if (loadExtractor(fallback, subtitleCallback, callback)) return true
+                } catch (e: Exception) {
+                    // best effort
+                }
+            }
+            false
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    // Last-resort fallback: scrape direct .m3u8 / .mp4 URLs out of an
+    // embed page and emit them with the embed as Referer.
+    private suspend fun extractM3u8Links(
+        html: String,
+        base: String,
+        label: String,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        var found = false
+        val re = Regex("""https?://[^\s"'\\]+\.(?:m3u8|mp4)(?:[^\s"'\\]*)""")
+        val seen = mutableSetOf<String>()
+        for (m in re.findAll(html)) {
+            val url = m.value.trim().trimEnd('.', ',', ';')
+            if (url.isBlank() || !seen.add(url)) continue
+            val isM3u8 = url.substringBefore("?").lowercase().endsWith(".m3u8")
+            try {
+                callback(
+                    newExtractorLink(
+                        source = "MultiMovies",
+                        name = label,
+                        url = url,
+                        type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
+                    ) {
+                        this.quality = Qualities.Unknown.value
+                        this.referer = base
+                        this.headers = playbackHeaders(base)
+                    }
+                )
+                found = true
+            } catch (e: Exception) {
+                // one bad link must not kill the rest
             }
         }
         return found

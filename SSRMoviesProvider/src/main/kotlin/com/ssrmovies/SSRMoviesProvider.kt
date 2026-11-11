@@ -30,7 +30,7 @@ import org.jsoup.Jsoup
 
 class SSRMoviesProvider : MainAPI() {
 
-    override var mainUrl = "https://new1.ssrmovies.page"
+    override var mainUrl = "https://site2.ssrmovies.page"
     override var name = "SSRMovies"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
     override var lang = "en"
@@ -38,7 +38,7 @@ class SSRMoviesProvider : MainAPI() {
 
     private val browserHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer" to "https://new1.ssrmovies.page/",
+        "Referer" to "https://site2.ssrmovies.page/",
     )
 
     // One download button on a detail page.

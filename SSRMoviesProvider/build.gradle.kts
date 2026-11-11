@@ -1,5 +1,5 @@
 // Use an integer for version numbers
-version = 1
+version = 2
 
 cloudstream {
     description = "Bollywood & Hollywood dual audio Hindi movies and web series from SSRMovies"
@@ -15,7 +15,7 @@ cloudstream {
     status = 1
 
     tvTypes = listOf("Movie", "TvSeries")
-    iconUrl = "https://new1.ssrmovies.page/wp-content/uploads/2024/10/SSRmovies.COM-Icon.png"
+    iconUrl = "https://site2.ssrmovies.page/wp-content/uploads/2024/10/SSRmovies.COM-Icon.png"
 
     isCrossPlatform = true
 }

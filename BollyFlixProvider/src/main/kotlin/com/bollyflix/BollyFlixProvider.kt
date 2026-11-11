@@ -275,6 +275,7 @@ class BollyFlixProvider : MainAPI() {
                     this.name = "Part $part – Episode $epNum"
                     this.episode = epNum
                     this.season = part
+                    this.posterUrl = poster
                 })
             } else if (text.contains("Season Zip", true)) {
                 val dataJson = toJson(EpisodeData(links = listOf(
@@ -283,6 +284,7 @@ class BollyFlixProvider : MainAPI() {
                 episodes.add(newEpisode(dataJson) {
                     this.name = "Part $part – Season Zip"
                     this.season = part
+                    this.posterUrl = poster
                 })
             }
         }

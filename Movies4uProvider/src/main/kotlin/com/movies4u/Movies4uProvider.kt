@@ -221,12 +221,14 @@ class Movies4uProvider : MainAPI() {
                     episodes.add(newEpisode(dataJson) {
                         this.name = "Season Pack"
                         this.season = season
+                        this.posterUrl = poster
                     })
                 } else {
                     episodes.add(newEpisode(dataJson) {
                         this.name = "Episode $epNum"
                         this.episode = epNum
                         this.season = season
+                        this.posterUrl = poster
                     })
                 }
             }

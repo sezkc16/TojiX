@@ -179,6 +179,7 @@ class HDHub4uProvider : MainAPI() {
                 episodes.add(newEpisode(dataJson) {
                     this.name = "Episode $epNum"
                     this.episode = epNum
+                    this.posterUrl = poster
                 })
             }
             // Season packs (1080p / 4K) as extra episodes
@@ -202,6 +203,7 @@ class HDHub4uProvider : MainAPI() {
                 val dataJson = toJson(EpisodeData(links = listOf(LinkEntry(label, "hubdrive", pid, qualityValue(label))))) ?: continue
                 episodes.add(newEpisode(dataJson) {
                     this.name = "Season Pack ($label)"
+                    this.posterUrl = poster
                 })
             }
             if (episodes.isEmpty()) return null

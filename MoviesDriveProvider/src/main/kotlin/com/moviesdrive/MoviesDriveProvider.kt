@@ -239,12 +239,14 @@ class MoviesDriveProvider : MainAPI() {
             episodes.add(newEpisode(dataJson) {
                 this.name = "Episode $epNum"
                 this.episode = epNum
+                this.posterUrl = poster
             })
         }
         for (pack in packs) {
             val dataJson = toJson(EpisodeData(links = listOf(pack))) ?: continue
             episodes.add(newEpisode(dataJson) {
                 this.name = "Season Pack (${pack.label})"
+                this.posterUrl = poster
             })
         }
         if (episodes.isEmpty()) return null

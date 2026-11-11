@@ -430,6 +430,7 @@ class GokuHDProvider : MainAPI() {
                     this.name = "Episode $epNum"
                     this.season = season
                     this.episode = epNum
+                    this.posterUrl = poster
                 })
             }
             for ((season, links) in packMap) {
@@ -438,6 +439,7 @@ class GokuHDProvider : MainAPI() {
                     this.name = "Season Pack"
                     this.season = season
                     this.episode = 0
+                    this.posterUrl = poster
                 })
             }
             if (episodes.isEmpty()) return null

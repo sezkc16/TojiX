@@ -82,6 +82,41 @@ class SSRMoviesProvider : MainAPI() {
         } catch (e: Exception) { null }
     }
 
+    // Robustly pull a real http(s) URL out of the `data` string load() gets.
+    // The app normally passes our LoadData JSON {"u":...,"p":...}, but a
+    // stale/cached entry or a SearchResponse JSON ({"posterUrl":...,"url":...})
+    // can arrive instead — passing a raw JSON object to app.get() throws
+    // "Expected URL scheme 'http' or 'https' but no scheme was found for
+    // {"post...". Never throw: return null so load() returns null gracefully.
+    private fun extractUrl(data: String): String? {
+        tryParseJson<LoadData>(data)?.url?.takeIf { it.startsWith("http") }?.let { return it }
+        // Generic JSON: look for a "url" (or "u") field that is an http URL.
+        try {
+            val node = com.fasterxml.jackson.databind.ObjectMapper().readTree(data)
+            if (node != null && node.isObject) {
+                for (key in listOf("url", "u", "link")) {
+                    node.get(key)?.asText()?.takeIf { it.startsWith("http") }?.let { return it }
+                }
+            }
+        } catch (e: Exception) { }
+        if (data.startsWith("http")) return data
+        // Last resort: first http(s) URL anywhere in the string.
+        return Regex("https?://[^\"'\\s\\\\]+").find(data)?.value
+    }
+
+    private fun extractPoster(data: String, parsed: LoadData?): String? {
+        parsed?.poster?.takeIf { it.startsWith("http") }?.let { return it }
+        try {
+            val node = com.fasterxml.jackson.databind.ObjectMapper().readTree(data)
+            if (node != null && node.isObject) {
+                for (key in listOf("posterUrl", "poster", "p")) {
+                    node.get(key)?.asText()?.takeIf { it.startsWith("http") }?.let { return it }
+                }
+            }
+        } catch (e: Exception) { }
+        return null
+    }
+
     private fun cleanText(raw: String): String {
         return raw.replace(Regex("\\s+"), " ").trim()
     }
@@ -194,8 +229,8 @@ class SSRMoviesProvider : MainAPI() {
 
     override suspend fun load(data: String): LoadResponse? {
         val parsed = tryParseJson<LoadData>(data)
-        val url = parsed?.url ?: data
-        val posterFromList = parsed?.poster
+        val url = extractUrl(data) ?: return null
+        val posterFromList = extractPoster(data, parsed)
         val html = app.get(url, headers = browserHeaders).text
         val doc = Jsoup.parse(html)
         val rawTitle = doc.selectFirst("h1")?.text()?.trim()
@@ -331,6 +366,7 @@ class SSRMoviesProvider : MainAPI() {
         var found = false
         ep.links?.forEach { entry ->
             if (entry.host != "lz") return@forEach
+            if (!entry.id.startsWith("http")) return@forEach
             // The linkszilla gate (plain GET, follows a 302) lists the
             // real hosts in its unlocked page HTML: HubCloud + GDFlix.
             val gateHtml = try {

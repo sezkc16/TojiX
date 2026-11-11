@@ -337,8 +337,12 @@ class SSRMoviesProvider : MainAPI() {
     // links and some are DEAD (404), so validate each with a HEAD request
     // and return the first that actually exists.
     private suspend fun resolveHubCloudDirect(hubCode: String): String? {
-        val hubUrl = "https://hubcloud.ist/drive/$hubCode"
-        val hubHtml = try { app.get(hubUrl, headers = browserHeaders).text } catch (e: Exception) { return null }
+        // The gate lists hubcloud.pw; .ist only 302-redirects to .pw, so
+        // fetch .pw directly (one less hop that can fail on the phone).
+        val hubUrl = "https://hubcloud.pw/drive/$hubCode"
+        val hubHtml = try { app.get(hubUrl, headers = browserHeaders).text } catch (e: Exception) {
+            try { app.get("https://hubcloud.ist/drive/$hubCode", headers = browserHeaders).text } catch (e2: Exception) { return null }
+        }
         val gamerUrl = Regex("https?://gamerxyt\\.com/hubcloud\\.php\\?host=hubcloud&id=[A-Za-z0-9]+&token=<redacted>")
             .find(hubHtml)?.value ?: return null
         val gamerHtml = try { app.get(gamerUrl, headers = browserHeaders).text } catch (e: Exception) { return null }
@@ -399,6 +403,19 @@ class SSRMoviesProvider : MainAPI() {
             if (!gdflixUrl.isNullOrEmpty()) {
                 try {
                     loadExtractor(gdflixUrl, subtitleCallback, callback)
+                    found = true
+                } catch (e: Exception) { }
+            }
+            // Fallback stream hosts on the same gate page (best effort).
+            // If HubCloud is unreachable from the phone, one of these
+            // usually still resolves to a playable link.
+            val streamUrls = listOf(
+                Regex("https?://watch-online\\.mom/e/[A-Za-z0-9]+").find(gateHtml)?.value,
+                Regex("https?://streamtape\\.com/v/[A-Za-z0-9]+").find(gateHtml)?.value,
+            ).filterNotNull().distinct()
+            for (streamUrl in streamUrls) {
+                try {
+                    loadExtractor(streamUrl, subtitleCallback, callback)
                     found = true
                 } catch (e: Exception) { }
             }

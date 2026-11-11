@@ -1,0 +1,372 @@
+package com.ssrmovies
+
+import com.fasterxml.jackson.annotation.JsonProperty
+import com.lagradost.cloudstream3.Episode
+import com.lagradost.cloudstream3.HomePageList
+import com.lagradost.cloudstream3.HomePageResponse
+import com.lagradost.cloudstream3.LoadResponse
+import com.lagradost.cloudstream3.MainAPI
+import com.lagradost.cloudstream3.MainPageRequest
+import com.lagradost.cloudstream3.MovieLoadResponse
+import com.lagradost.cloudstream3.SearchResponseList
+import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.TvType
+import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.mainPageOf
+import com.lagradost.cloudstream3.newEpisode
+import com.lagradost.cloudstream3.newHomePageResponse
+import com.lagradost.cloudstream3.newMovieLoadResponse
+import com.lagradost.cloudstream3.newTvSeriesLoadResponse
+import com.lagradost.cloudstream3.newTvSeriesSearchResponse
+import com.lagradost.cloudstream3.newMovieSearchResponse
+import com.lagradost.cloudstream3.toNewSearchResponseList
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.loadExtractor
+import org.jsoup.Jsoup
+
+class SSRMoviesProvider : MainAPI() {
+
+    override var mainUrl = "https://new1.ssrmovies.page"
+    override var name = "SSRMovies"
+    override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
+    override var lang = "en"
+    override val hasMainPage = true
+
+    private val browserHeaders = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer" to "https://new1.ssrmovies.page/",
+    )
+
+    // One download button on a detail page.
+    // host "lz" = a secure.linkszilla.top/view/<code> button. The gate page
+    // (plain GET, follows a 302) lists the real hosts (HubCloud, GDFlix).
+    data class LinkEntry(
+        @JsonProperty("label") val label: String,
+        @JsonProperty("host") val host: String,
+        @JsonProperty("id") val id: String,
+        @JsonProperty("q") val quality: Int,
+    )
+
+    data class EpisodeData(
+        @JsonProperty("links") val links: List<LinkEntry>? = null,
+    )
+
+    // One download button on a detail page (label + gate URL + episode range).
+    private data class Btn(val label: String, val gateUrl: String, val epStart: Int?, val epEnd: Int?)
+
+    // Passed through the SearchResponse url so load() knows the poster:
+    // detail pages have NO poster image (no og:image, no content image).
+    data class LoadData(
+        @JsonProperty("u") val url: String,
+        @JsonProperty("p") val poster: String? = null,
+    )
+
+    private fun qualityValue(label: String): Int {
+        return when {
+            label.contains("2160") || label.contains("4K", true) -> Qualities.P2160.value
+            label.contains("1080") -> Qualities.P1080.value
+            label.contains("720") -> Qualities.P720.value
+            label.contains("480") -> Qualities.P480.value
+            label.contains("360") -> Qualities.P360.value
+            else -> Qualities.Unknown.value
+        }
+    }
+
+    private fun toJson(data: Any): String? {
+        return try {
+            com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(data)
+        } catch (e: Exception) { null }
+    }
+
+    private fun cleanText(raw: String): String {
+        return raw.replace(Regex("\\s+"), " ").trim()
+    }
+
+    private fun extractYear(raw: String): Int? {
+        return Regex("\\b(19\\d{2}|20\\d{2})\\b").find(raw)?.groupValues?.getOrNull(1)?.toIntOrNull()
+    }
+
+    // Strip quality/format/source tokens so "The Odyssey 2026 Dual Audio
+    // Hindi (Cleaned) 1080p 720p 480p BluRay x264 ESubs" displays as
+    // "The Odyssey". The year is removed here too (it is stored separately).
+    private fun cleanTitle(raw: String): String {
+        var t = raw.replace(Regex("\\[.*?\\]"), " ")
+        t = t.replace(Regex("\\b(19\\d{2}|20\\d{2})\\b"), " ")
+        t = t.replace(
+            Regex("(?i)\\b(2160p|1080p|720p|480p|360p|4k|blu-ray|bluray|web-dl|webdl|hdrip|hdcam|hdts|proper|multi|dual audio|hindi|esub|esubs|x264|x265|h\\.?264|h\\.?265|hevc|amzn|nf|jhs|org|5\\.1|cleaned|uncut|hindi dubbed|dubbed)\\b"),
+            " "
+        )
+        t = t.replace(Regex("(?i)\\bS\\d{1,2}\\b"), " ")
+        // Drop parens/brackets emptied by the token removal above, e.g.
+        // "(ORG 5.1)" -> "()" and "(Cleaned)" -> "()".
+        t = t.replace(Regex("\\(\\s*\\)"), " ")
+        t = t.replace(Regex("\\[\\s*\\]"), " ")
+        t = t.replace(Regex("[\\s\\-:–]+"), " ").trim()
+        return t.trim(' ', '-', '–', ':')
+    }
+
+    private fun seasonFrom(raw: String): Int? {
+        return Regex("(?i)\\bS0*(\\d+)\\b").find(raw)?.groupValues?.getOrNull(1)?.toIntOrNull()
+    }
+
+    private fun isSeriesTitle(raw: String, slug: String): Boolean {
+        if (Regex("(?i)\\bS\\d{1,2}\\b").containsMatchIn(raw)) return true
+        if (Regex("(?i)-s\\d{1,2}(-|$)").containsMatchIn(slug)) return true
+        if (raw.contains("Complete", true)) return true
+        return false
+    }
+
+    // Poster: the listing img is lazy-loaded (src is a 1x1 gif); the real
+    // poster is in style="background:url('https://imgurworld.top/...')".
+    private fun posterFrom(img: org.jsoup.nodes.Element?): String? {
+        if (img == null) return null
+        val style = img.attr("style")
+        val bg = Regex("""url\(['"]?([^'")]+)['"]?\)""").find(style)?.groupValues?.getOrNull(1)
+        if (!bg.isNullOrEmpty()) return bg
+        val src = img.attr("src").takeIf { it.isNotEmpty() && !it.startsWith("data:") }
+        if (src != null) return src
+        return img.attr("data-src").takeIf { it.isNotEmpty() }
+    }
+
+    // Parse a listing page (home / category / search) into search responses.
+    // Cards are article.latestPost > a.post-image[href] + h2.title a.
+    private fun parseListing(html: String): List<com.lagradost.cloudstream3.SearchResponse> {
+        val doc = Jsoup.parse(html)
+        val out = mutableListOf<com.lagradost.cloudstream3.SearchResponse>()
+        val seen = mutableSetOf<String>()
+        for (article in doc.select("article.latestPost")) {
+            val a = article.selectFirst("a.post-image[href]") ?: article.selectFirst("a[href]") ?: continue
+            val href = a.attr("href")
+            if (href.isEmpty()) continue
+            val url = if (href.startsWith("http")) href else mainUrl + href
+            if (!seen.add(url)) continue
+            val titleEl = article.selectFirst("h2.title a") ?: a
+            val rawTitle = cleanText(titleEl.attr("title").ifEmpty { titleEl.text() })
+            if (rawTitle.isEmpty()) continue
+            val poster = posterFrom(article.selectFirst("img"))
+            val display = cleanTitle(rawTitle)
+            if (display.isEmpty()) continue
+            val loadJson = toJson(LoadData(url, poster)) ?: url
+            if (isSeriesTitle(rawTitle, url)) {
+                out.add(newTvSeriesSearchResponse(display, loadJson, TvType.TvSeries) { this.posterUrl = poster })
+            } else {
+                out.add(newMovieSearchResponse(display, loadJson, TvType.Movie) { this.posterUrl = poster })
+            }
+        }
+        return out
+    }
+
+    override val mainPage = mainPageOf(
+        "" to "Latest Releases",
+        "category/dual-audio-movies/" to "Dual Audio",
+        "category/bollywood-movies/" to "Bollywood",
+        "category/hollywood-movies-hd/" to "Hollywood",
+        "category/web-series/" to "Web Series",
+        "category/4k-movies/" to "4K Movies",
+        "category/telugu-movies/" to "Telugu",
+        "category/tamil-movies/" to "Tamil",
+        "category/punjabi-movies/" to "Punjabi",
+        "category/animated-movies/" to "Animated",
+    )
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val cat = request.data
+        val url = when {
+            cat.isEmpty() && page <= 1 -> mainUrl
+            cat.isEmpty() -> "$mainUrl/page/$page/"
+            page <= 1 -> "$mainUrl/$cat"
+            else -> "$mainUrl/${cat.removeSuffix("/")}/page/$page/"
+        }
+        val html = app.get(url, headers = browserHeaders).text
+        val list = parseListing(html)
+        return newHomePageResponse(HomePageList(request.name, list), hasNext = list.isNotEmpty())
+    }
+
+    override suspend fun search(query: String, page: Int): SearchResponseList? {
+        val url = "$mainUrl/?s=${query.trim().replace(" ", "+")}"
+        val html = app.get(url, headers = browserHeaders).text
+        return parseListing(html).toNewSearchResponseList()
+    }
+
+    override suspend fun load(data: String): LoadResponse? {
+        val parsed = tryParseJson<LoadData>(data)
+        val url = parsed?.url ?: data
+        val posterFromList = parsed?.poster
+        val html = app.get(url, headers = browserHeaders).text
+        val doc = Jsoup.parse(html)
+        val rawTitle = doc.selectFirst("h1")?.text()?.trim()
+            ?: doc.selectFirst("title")?.text()?.trim()?.substringBefore("–")?.trim()
+            ?: ""
+        if (rawTitle.isEmpty()) return null
+        val title = cleanTitle(rawTitle)
+        if (title.isEmpty()) return null
+        val year = extractYear(rawTitle)
+        val poster = posterFromList
+        val plot = doc.select("p").map { cleanText(it.text()) }
+            .firstOrNull { it.length >= 100 }
+        val seasonNum = seasonFrom(rawTitle) ?: seasonFrom(url) ?: 1
+
+        // Download buttons: a[href*=linkszilla] with labels like
+        // "Watch & Download in 1080p - 3.45GB" (movie) or
+        // "Download (Ep 08) 1080p - 1.34GB" (series) or
+        // "Download (Ep 01-04) 1080p - 3.45GB" (pack).
+        val buttons = mutableListOf<Btn>()
+        for (a in doc.select("a[href*=linkszilla]")) {
+            val gate = a.attr("href")
+            if (gate.isEmpty()) continue
+            val label = cleanText(a.text())
+            if (label.isEmpty()) continue
+            val epMatch = Regex("\\(Ep\\s*(\\d+)(?:\\s*-\\s*(\\d+))?\\)", RegexOption.IGNORE_CASE).find(label)
+            val epStart = epMatch?.groupValues?.getOrNull(1)?.toIntOrNull()
+            val epEnd = epMatch?.groupValues?.getOrNull(2)?.toIntOrNull() ?: epStart
+            buttons.add(Btn(label, gate, epStart, epEnd))
+        }
+        if (buttons.isEmpty()) return null
+        val isSeries = buttons.any { it.epStart != null } || isSeriesTitle(rawTitle, url)
+
+        fun entryFor(btn: Btn): LinkEntry {
+            val size = Regex("(\\d+(\\.\\d+)?\\s*(GB|MB))").find(btn.label)?.groupValues?.getOrNull(1).orEmpty()
+            val qPart = when {
+                btn.label.contains("2160") || btn.label.contains("4K", true) -> "2160p"
+                btn.label.contains("1080") -> "1080p"
+                btn.label.contains("720") -> "720p"
+                btn.label.contains("480") -> "480p"
+                btn.label.contains("360") -> "360p"
+                else -> ""
+            }
+            val label = (qPart + (if (size.isNotEmpty()) " [$size]" else "")).trim()
+                .ifEmpty { btn.label }
+            return LinkEntry(label, "lz", btn.gateUrl, qualityValue(btn.label))
+        }
+
+        if (isSeries) {
+            // Group by episode number so one CloudStream episode carries
+            // ALL quality variants (user picks the highest at play time).
+            val epMap = linkedMapOf<Int, MutableList<LinkEntry>>()
+            val epNames = linkedMapOf<Int, String>()
+            for (btn in buttons) {
+                val start = btn.epStart ?: continue
+                val end = btn.epEnd ?: start
+                val key = start
+                val links = epMap.getOrPut(key) { mutableListOf() }
+                val entry = entryFor(btn)
+                if (links.none { it.id == entry.id }) links.add(entry)
+                val name = if (end != start) "Episode $start-$end" else "Episode $start"
+                epNames[key] = name
+            }
+            val episodes = mutableListOf<Episode>()
+            for ((epNum, links) in epMap) {
+                if (links.isEmpty()) continue
+                val dataJson = toJson(EpisodeData(links = links)) ?: continue
+                episodes.add(newEpisode(dataJson) {
+                    this.name = epNames[epNum] ?: "Episode $epNum"
+                    this.episode = epNum
+                    this.season = seasonNum
+                    this.posterUrl = poster
+                })
+            }
+            if (episodes.isEmpty()) return null
+            episodes.sortWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
+            return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+                this.posterUrl = poster
+                this.plot = plot
+                this.year = year
+            }
+        } else {
+            val links = mutableListOf<LinkEntry>()
+            val seenGate = mutableSetOf<String>()
+            for (btn in buttons) {
+                val entry = entryFor(btn)
+                if (seenGate.add(entry.id)) links.add(entry)
+            }
+            if (links.isEmpty()) return null
+            val dataJson = toJson(EpisodeData(links = links)) ?: return null
+            return newMovieLoadResponse(title, url, TvType.Movie, dataJson) {
+                this.posterUrl = poster
+                this.plot = plot
+                this.year = year
+            }
+        }
+    }
+
+    // Resolve a HubCloud file id all the way to the direct video file.
+    // Chain: hubcloud.ist/drive/<code> -> gamerxyt.php link (in the page)
+    // -> direct file. The gamerxyt page gives EITHER a Cloudflare R2 .mkv
+    // URL or Pixeldrain links (page URL, NOT playable) -> convert those to
+    // the Pixeldrain direct API URL (pixeldrain.dev/api/file/<id>), which
+    // IS a playable video file. NOTE: the page lists several Pixeldrain
+    // links and some are DEAD (404), so validate each with a HEAD request
+    // and return the first that actually exists.
+    private suspend fun resolveHubCloudDirect(hubCode: String): String? {
+        val hubUrl = "https://hubcloud.ist/drive/$hubCode"
+        val hubHtml = try { app.get(hubUrl, headers = browserHeaders).text } catch (e: Exception) { return null }
+        val gamerUrl = Regex("https?://gamerxyt\\.com/hubcloud\\.php\\?host=hubcloud&id=[A-Za-z0-9]+&token=<redacted>")
+            .find(hubHtml)?.value ?: return null
+        val gamerHtml = try { app.get(gamerUrl, headers = browserHeaders).text } catch (e: Exception) { return null }
+        Regex("https?://[^\"' ]+\\.r2\\.cloudflarestorage\\.com/[^\"' ]+")
+            .find(gamerHtml)?.value?.let { return it }
+        val pdIds = Regex("https?://pixeldrain\\.dev/u/([A-Za-z0-9]+)")
+            .findAll(gamerHtml).map { it.groupValues[1] }.distinct().toList()
+        for (id in pdIds) {
+            val apiUrl = "https://pixeldrain.dev/api/file/$id"
+            val ok = try {
+                app.head(apiUrl, headers = browserHeaders).code == 200
+            } catch (e: Exception) { false }
+            if (ok) return apiUrl
+        }
+        return null
+    }
+
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val ep = tryParseJson<EpisodeData>(data) ?: return false
+        var found = false
+        ep.links?.forEach { entry ->
+            if (entry.host != "lz") return@forEach
+            // The linkszilla gate (plain GET, follows a 302) lists the
+            // real hosts in its unlocked page HTML: HubCloud + GDFlix.
+            val gateHtml = try {
+                app.get(entry.id, headers = browserHeaders).text
+            } catch (e: Exception) { return@forEach }
+            // HubCloud (primary, proven): hubcloud.pw/drive/<code>.
+            val hubCode = Regex("hubcloud\\.pw/drive/([A-Za-z0-9]+)")
+                .find(gateHtml)?.groupValues?.getOrNull(1)
+            if (!hubCode.isNullOrEmpty()) {
+                val direct = resolveHubCloudDirect(hubCode)
+                if (!direct.isNullOrEmpty()) {
+                    callback(
+                        newExtractorLink(
+                            source = "HubCloud",
+                            name = "HubCloud ${entry.label}",
+                            url = direct,
+                            type = ExtractorLinkType.VIDEO
+                        ) {
+                            this.quality = entry.quality
+                            this.referer = "https://hubcloud.pw/"
+                        }
+                    )
+                    found = true
+                }
+            }
+            // GDFlix (best effort via the built-in extractors; CF-403
+            // from a VM, so unverified here — the phone test is the proof).
+            val gdflixUrl = Regex("https?://[^\"'\\s]*gdflix[^\"'\\s]*/file/[A-Za-z0-9]+")
+                .find(gateHtml)?.value
+            if (!gdflixUrl.isNullOrEmpty()) {
+                try {
+                    loadExtractor(gdflixUrl, subtitleCallback, callback)
+                    found = true
+                } catch (e: Exception) { }
+            }
+        }
+        return found
+    }
+}

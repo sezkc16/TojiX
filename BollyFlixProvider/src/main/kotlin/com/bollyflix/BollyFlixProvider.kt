@@ -242,7 +242,7 @@ class BollyFlixProvider : MainAPI() {
                 val part = currentPart ?: continue
                 if (fxUrl.isEmpty()) continue
                 if (!fxUrl.contains("fxlinks.")) continue
-                fetchFxlinksPart(fxUrl, part, episodes)
+                fetchFxlinksPart(fxUrl, part, episodes, poster)
             }
         }
         if (episodes.isEmpty()) return null
@@ -256,7 +256,7 @@ class BollyFlixProvider : MainAPI() {
     // and add one episode per fastdlserver link it lists.
     // The part number becomes the CloudStream season, so episode
     // numbers (which restart at 01 in every part) stay distinct.
-    private suspend fun fetchFxlinksPart(fxUrl: String, part: Int, episodes: MutableList<Episode>) {
+    private suspend fun fetchFxlinksPart(fxUrl: String, part: Int, episodes: MutableList<Episode>, poster: String?) {
         val html = try {
             app.get(fxUrl, headers = browserHeaders).text
         } catch (e: Exception) { return }

@@ -221,9 +221,14 @@ class GokuHDProvider : MainAPI() {
     }
 
     // One quality section on a detail page: the nexdrive links under an
-    // <h4> heading such as "Title [Season 18] {...} 720p x264 [180MB/E]".
+    // <h4> heading such as "Title [Season 18] {...} 720p x264 [180MB/E]"
+    // (OLD style) or "Download Title S02 {...} 720p x264 [200MB/E]"
+    // (CURRENT style — season written as S0N, NOT "Season N"). Parts of a
+    // season are "S04 – Part 02" (episode numbers CONTINUE across parts:
+    // Part 01 = E01–E11, Part 02 = E12–E17 on the live Re:Zero page).
     private data class DetailSection(
         val season: Int?,
+        val part: Int?,
         val quality: String,
         val size: String?,
         val gdirectUrl: String?,
@@ -236,7 +241,12 @@ class GokuHDProvider : MainAPI() {
         for (h in doc.select("h4")) {
             val text = h.text().trim()
             val q = Regex("(?i)(2160p|1080p|720p|480p|360p|4K)").find(text)?.groupValues?.get(1) ?: continue
+            // Season: "Season 18" (old) OR "S02" (current). "Season" is
+            // tried first so the S-pattern never misreads "Season" itself.
             val season = Regex("(?i)Season\\s*(\\d+)").find(text)?.groupValues?.get(1)?.toIntOrNull()
+                ?: Regex("(?i)\\bS0*(\\d+)\\b").find(text)?.groupValues?.get(1)?.toIntOrNull()
+            // Part of a season: "S04 – Part 02" (null when not a split season).
+            val part = Regex("(?i)Part\\s*0*(\\d+)").find(text)?.groupValues?.get(1)?.toIntOrNull()
             val size = Regex("""\[([0-9.]+ ?[MG]B(?:/E)?)\]""").find(text)?.groupValues?.get(1)
             var gdirect: String? = null
             var vcloud: String? = null
@@ -258,7 +268,7 @@ class GokuHDProvider : MainAPI() {
                 sib = sib.nextElementSibling()
             }
             if (gdirect == null && vcloud == null && batch == null) continue
-            out.add(DetailSection(season, q.uppercase(), size, gdirect, vcloud, batch))
+            out.add(DetailSection(season, part, q.uppercase(), size, gdirect, vcloud, batch))
         }
         return out
     }
@@ -372,8 +382,18 @@ class GokuHDProvider : MainAPI() {
         if (isSeries) {
             val epMap = mutableMapOf<Pair<Int, Int>, MutableList<LinkEntry>>()
             val packMap = mutableMapOf<Int, MutableList<LinkEntry>>()
-            val bySeason = sections.groupBy { it.season ?: 1 }
-            for ((season, secs) in bySeason) {
+            // Group by (season, part): every section of one season/part
+            // lists the SAME episodes on its nexdrive page, so one probe
+            // per group enumerates it. Grouping by season alone is WRONG
+            // for the current S0N headings (season parsed as null for all
+            // of them) — every season collapsed into season 1 and only the
+            // first section's episodes were listed (Blue Box showed 5
+            // episodes instead of 30; S01 E06–E25 never appeared).
+            // Episode numbers continue across parts, so (season, ep) stays
+            // the episode key and parts of one season merge correctly.
+            val bySeason = sections.groupBy { (it.season ?: 1) to (it.part ?: 0) }
+            for ((seasonPart, secs) in bySeason) {
+                val season = seasonPart.first
                 // Enumerate the season's episode numbers from ONE nexdrive
                 // page (all qualities of a season list the same episodes).
                 var epNums: List<Int> = emptyList()

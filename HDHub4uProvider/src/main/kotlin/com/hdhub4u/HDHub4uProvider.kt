@@ -56,6 +56,13 @@ class HDHub4uProvider : MainAPI() {
         @JsonProperty("links") val links: List<LinkEntry>? = null,
     )
 
+    // Decoded greenmotors JSON: {"w":10,"l":".../homelander/","o":"<b64 target>","data":"...","blog_url":"..."}
+    data class GmPayload(
+        @JsonProperty("o") val o: String? = null,
+        @JsonProperty("data") val data: String? = null,
+        @JsonProperty("blog_url") val blogUrl: String? = null,
+    )
+
     private fun qualityValue(label: String): Int {
         return when {
             label.contains("2160") || label.contains("4K", true) -> Qualities.P2160.value
@@ -206,6 +213,74 @@ class HDHub4uProvider : MainAPI() {
                     this.posterUrl = poster
                 })
             }
+            // Pack/batch layout (e.g. Study Group): no "EPiSODE N"
+            // sections at all. The page offers hubdrive.blog/packs/<slug>
+            // EP packs ("480p EP – PACK" ...), greenmotors batch ZIPs
+            // ("480p x264 [1.6GB]" ...) and hubdrive file packs
+            // ("1080p WEB-DL PACK [21.7GB]"). The context-window pack
+            // check above misses these (the label sits AFTER the href,
+            // outside its 40-char lookahead), so handle them here with
+            // anchor text instead of a raw context window.
+            val season = Regex("(?i)Season\\s*(\\d+)").find(title)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
+            val usedIds = mutableSetOf<String>()
+            for (ep in episodes) {
+                val d = tryParseJson<EpisodeData>(ep.data) ?: continue
+                d.links?.forEach { usedIds.add(it.id) }
+            }
+            val usedGm = mutableSetOf<String>()
+            // (a) EP packs -> per-episode entries, merged by episode
+            // number across the quality packs (only when the EPiSODE
+            // pass found nothing, so episodes are never duplicated).
+            if (episodes.isEmpty()) {
+                val byEpisode = sortedMapOf<Int, MutableList<LinkEntry>>()
+                for (a in doc.select("a[href*=hubdrive.blog/packs/]")) {
+                    var packUrl = a.attr("href")
+                    if (packUrl.isEmpty()) continue
+                    if (!packUrl.startsWith("http")) packUrl = "https://hubdrive.blog$packUrl"
+                    val btnText = cleanTitle(a.text())
+                    val qToken = Regex("(?i)(2160|1080|720|480)p").find(btnText)?.value ?: continue
+                    fetchHubDrivePack(packUrl, qToken, byEpisode, usedIds)
+                }
+                for ((epNum, links) in byEpisode) {
+                    val dataJson = toJson(EpisodeData(links = links)) ?: continue
+                    episodes.add(newEpisode(dataJson) {
+                        this.name = "Episode $epNum"
+                        this.episode = epNum
+                        this.season = season
+                        this.posterUrl = poster
+                    })
+                }
+            }
+            // (b) hubdrive file pack/batch links as extra episodes.
+            for (a in doc.select("a[href*=hubdrive.blog/file/]")) {
+                val href = a.attr("href")
+                val id = href.substringAfter("hubdrive.blog/file/").substringBefore("/").substringBefore("?").trim()
+                if (id.isEmpty() || id in usedIds) continue
+                val txt = cleanTitle(a.text())
+                if (txt.isEmpty()) continue
+                usedIds.add(id)
+                val dataJson = toJson(EpisodeData(links = listOf(LinkEntry(txt, "hubdrive", id, qualityValue(txt))))) ?: continue
+                episodes.add(newEpisode(dataJson) {
+                    this.name = txt
+                    this.season = season
+                    this.posterUrl = poster
+                })
+            }
+            // (c) greenmotors batch ZIP links as extra episodes
+            // (host "gm" resolves via the 4KHDHub greenmotors method).
+            for (a in doc.select("a[href*=greenmotors.club]")) {
+                val gmUrl = a.attr("href")
+                if (gmUrl.isEmpty() || gmUrl in usedGm) continue
+                val txt = cleanTitle(a.text())
+                if (txt.isEmpty()) continue
+                usedGm.add(gmUrl)
+                val dataJson = toJson(EpisodeData(links = listOf(LinkEntry(txt, "gm", gmUrl, qualityValue(txt))))) ?: continue
+                episodes.add(newEpisode(dataJson) {
+                    this.name = txt
+                    this.season = season
+                    this.posterUrl = poster
+                })
+            }
             if (episodes.isEmpty()) return null
             return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
                 this.posterUrl = poster
@@ -247,6 +322,43 @@ class HDHub4uProvider : MainAPI() {
         }
     }
 
+    // Fetch one hubdrive.blog/packs/<slug> page (a file listing whose
+    // rows are <div class="pack-clean-file"> with
+    // .pack-clean-title = "Show.S01E01.480p...mkv",
+    // .pack-clean-size = "171.55 MB" and the file id in the row's
+    // onclick "window.open('/file/<id>', '_blank')") and merge its
+    // per-episode hubdrive file links into byEpisode (keyed by episode
+    // number), so each episode accumulates every quality pack.
+    private suspend fun fetchHubDrivePack(
+        packUrl: String,
+        qToken: String,
+        byEpisode: MutableMap<Int, MutableList<LinkEntry>>,
+        usedIds: MutableSet<String>,
+    ) {
+        val html = try {
+            app.get(packUrl, headers = browserHeaders).text
+        } catch (e: Exception) { return }
+        val doc = Jsoup.parse(html)
+        val q = qualityValue(qToken)
+        for (row in doc.select("div.pack-clean-file")) {
+            val filename = row.selectFirst(".pack-clean-title")?.text()?.trim() ?: continue
+            val size = row.selectFirst(".pack-clean-size")?.text()?.trim() ?: ""
+            var id = Regex("/file/(\\d+)").find(row.attr("onclick"))?.groupValues?.getOrNull(1) ?: ""
+            if (id.isEmpty()) {
+                id = row.selectFirst("a[href*=/file/]")?.attr("href")
+                    ?.substringAfter("/file/")?.substringBefore("/")?.substringBefore("?")?.trim() ?: ""
+            }
+            if (id.isEmpty() || id in usedIds) continue
+            val epNum = Regex("(?i)S\\d+E(\\d+)").find(filename)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                ?: Regex("(?i)E(\\d+)").find(filename)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                ?: continue
+            usedIds.add(id)
+            val label = if (size.isNotEmpty()) "$qToken [$size]" else qToken
+            byEpisode.getOrPut(epNum) { mutableListOf() }
+                .add(LinkEntry(label, "hubdrive", id, q))
+        }
+    }
+
     // ---- Link resolvers ----
 
     private fun b64decode(input: String): String? {
@@ -254,6 +366,97 @@ class HDHub4uProvider : MainAPI() {
             val padded = input + "=".repeat((4 - input.length % 4) % 4)
             String(JavaBase64.getDecoder().decode(padded), Charsets.UTF_8)
         } catch (e: Exception) { null }
+    }
+
+    private fun b64decodeToString(input: String): String? {
+        return try {
+            val padded = input.trim() + "=".repeat((4 - input.trim().length % 4) % 4)
+            String(JavaBase64.getDecoder().decode(padded), Charsets.UTF_8)
+        } catch (e: Exception) { null }
+    }
+
+    private fun b64encode(input: String): String {
+        return JavaBase64.getEncoder().encodeToString(input.toByteArray(Charsets.UTF_8))
+    }
+
+    // ROT13 (Phisher's "pen" function).
+    private fun rot13(input: String): String {
+        return input.map {
+            when (it) {
+                in 'A'..'Z' -> ((it - 'A' + 13) % 26 + 'A'.code).toChar()
+                in 'a'..'z' -> ((it - 'a' + 13) % 26 + 'a'.code).toChar()
+                else -> it
+            }
+        }.joinToString("")
+    }
+
+    // greenmotors.club/?id=<token> -> the real HubCloud/HubDrive URL.
+    // The "Redirecting..." page contains s('o','<b64>') (fallback
+    // ck('_wp_http_<n>','<v>')). Decode: b64(b64(b64(s))) -> ROT13 -> b64
+    // -> JSON {"o":"<b64 target>","data":"...","blog_url":"..."}.
+    // (Ported from FourKHDHubProvider; verified live on HDHub4u series
+    // tokens — the target here is an hblinks.lol page, resolved further
+    // in resolveGmEntry.)
+    private suspend fun resolveGreenMotors(gmUrl: String): String? {
+        val html = try {
+            app.get(gmUrl, headers = browserHeaders).text
+        } catch (e: Exception) { return null }
+        val combined = buildString {
+            Regex("s\\('o','([A-Za-z0-9+/=]+)'").findAll(html).forEach {
+                append(it.groupValues[1])
+            }
+            Regex("ck\\('_wp_http_\\d+','([^']+)'").findAll(html).forEach {
+                append(it.groupValues[1])
+            }
+        }
+        if (combined.isEmpty()) return null
+        return try {
+            val step1 = b64decodeToString(combined) ?: return null
+            val step2 = b64decodeToString(step1) ?: return null
+            val step3 = b64decodeToString(rot13(step2)) ?: return null
+            val payload = tryParseJson<GmPayload>(step3) ?: return null
+            val encodedUrl = payload.o?.let { b64decodeToString(it) }?.trim().orEmpty()
+            if (encodedUrl.isNotEmpty()) return encodedUrl
+            // Fallback: <blog_url>?re=<b64(data)> returns the direct link as body text.
+            val blogUrl = payload.blogUrl?.trim().orEmpty()
+            val data = payload.data?.trim().orEmpty()
+            if (blogUrl.isNotEmpty() && data.isNotEmpty()) {
+                val direct = try {
+                    app.get("$blogUrl?re=${b64encode(data)}", headers = browserHeaders).text.trim()
+                } catch (e: Exception) { "" }
+                if (direct.startsWith("http")) return direct
+            }
+            null
+        } catch (e: Exception) { null }
+    }
+
+    // Resolve one greenmotors button to the direct video file URL.
+    // HDHub4u series tokens decode to an hblinks.lol page, which lists
+    // a hubcloud.pw/drive/<code> (preferred) or hubdrive.blog/file/<id>.
+    private suspend fun resolveGmEntry(gmUrl: String): String? {
+        val target = resolveGreenMotors(gmUrl) ?: return null
+        return when {
+            target.contains("hubcloud.pw/drive/") -> {
+                val code = target.substringAfter("hubcloud.pw/drive/").substringBefore("/").substringBefore("?").trim()
+                if (code.isEmpty()) null else resolveHubCloudDirect(code)
+            }
+            target.contains("hubdrive.blog/file/") -> {
+                val id = target.substringAfter("hubdrive.blog/file/").substringBefore("/").substringBefore("?").trim()
+                if (id.isEmpty()) null else resolveHubDrive(id)
+            }
+            target.contains("hblinks.lol/") -> {
+                val html = try {
+                    app.get(target, headers = browserHeaders).text
+                } catch (e: Exception) { return null }
+                val code = Regex("hubcloud\\.pw/drive/([A-Za-z0-9]+)").find(html)?.groupValues?.getOrNull(1)
+                if (code != null) return resolveHubCloudDirect(code)
+                val fid = Regex("hubdrive\\.blog/file/(\\d+)").find(html)?.groupValues?.getOrNull(1)
+                if (fid != null) return resolveHubDrive(fid)
+                null
+            }
+            target.startsWith("http") -> target
+            else -> null
+        }
     }
 
     // hubcdn.club/file/<id> -> JS redirect page with a reurl:
@@ -328,6 +531,7 @@ class HDHub4uProvider : MainAPI() {
             val direct = when (entry.host) {
                 "hubcdn" -> resolveHubCdn(entry.id)
                 "hubdrive" -> resolveHubDrive(entry.id)
+                "gm" -> resolveGmEntry(entry.id)
                 else -> null
             } ?: return@forEach
             val source = if (entry.host == "hubcdn") "HubCdn" else "HubCloud"

@@ -1,5 +1,5 @@
 // Use an integer for version numbers
-version = 5
+version = 6
 
 cloudstream {
     description = "Bollywood & Hollywood dual audio Hindi movies and web series from SSRMovies"

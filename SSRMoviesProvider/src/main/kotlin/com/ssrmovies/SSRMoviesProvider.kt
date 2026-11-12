@@ -56,7 +56,10 @@ class SSRMoviesProvider : MainAPI() {
     )
 
     // One download button on a detail page (label + gate URL + episode range).
-    private data class Btn(val label: String, val gateUrl: String, val epStart: Int?, val epEnd: Int?)
+    // epName: display name from an "Episode N ..." heading above the button.
+    // groupKey: heading text for dateless "Episode – <date>" groups (WWE
+    // weekly shows), numbered after the walk, oldest group first.
+    private data class Btn(val label: String, val gateUrl: String, val epStart: Int?, val epEnd: Int?, val epName: String? = null, val groupKey: String? = null)
 
     // Passed through the SearchResponse url so load() knows the poster:
     // detail pages have NO poster image (no og:image, no content image).
@@ -249,19 +252,60 @@ class SSRMoviesProvider : MainAPI() {
         // "Watch & Download in 1080p - 3.45GB" (movie) or
         // "Download (Ep 08) 1080p - 1.34GB" (series) or
         // "Download (Ep 01-04) 1080p - 3.45GB" (pack).
+        // Episodic / weekly shows use a THIRD layout (Koffee With Karan,
+        // Bigg Boss, Sa Re Ga Ma Pa, WWE NXT, ...): headings
+        // "|| Episode 05 (Guests) ||" or "|| Episode – 10th November 2026 ||"
+        // above plain "Watch & Download in 1080p" buttons with NO (Ep N)
+        // in the label. The old code only read (Ep N) from the button label,
+        // so these pages had no episode data at all and load() returned null
+        // ("SSRMovies returned nothing"). Walk headings + buttons in
+        // document order so each button inherits the episode of the heading
+        // above it; dateless "Episode – <date>" groups are numbered after
+        // the walk, oldest group first, so old episodes keep their numbers.
         val buttons = mutableListOf<Btn>()
-        for (a in doc.select("a[href*=linkszilla]")) {
-            val gate = a.attr("href")
+        var currentEpStart: Int? = null
+        var currentEpEnd: Int? = null
+        var currentEpName: String? = null
+        var currentGroupKey: String? = null
+        for (el in doc.select("h1, h2, h3, h4, h5, h6, a[href*=linkszilla]")) {
+            if (el.tagName().matches(Regex("h[1-6]"))) {
+                val heading = cleanText(el.text())
+                val stripped = heading.trim('|', ' ').trim()
+                if (stripped.startsWith("Episode", true)) {
+                    val epMatch = Regex("Episode\\s*(\\d+)(?:\\s*-\\s*(\\d+))?", RegexOption.IGNORE_CASE).find(stripped)
+                    if (epMatch != null) {
+                        currentEpStart = epMatch.groupValues.getOrNull(1)?.toIntOrNull()
+                        currentEpEnd = epMatch.groupValues.getOrNull(2)?.toIntOrNull() ?: currentEpStart
+                        currentEpName = stripped.takeIf { it.isNotEmpty() }
+                        currentGroupKey = null
+                    } else {
+                        // Dateless heading, e.g. "Episode – 10th November 2026".
+                        currentEpStart = null
+                        currentEpEnd = null
+                        currentEpName = null
+                        currentGroupKey = stripped.takeIf { it.isNotEmpty() }
+                    }
+                } else {
+                    currentEpStart = null
+                    currentEpEnd = null
+                    currentEpName = null
+                    currentGroupKey = null
+                }
+                continue
+            }
+            val gate = el.attr("href")
             if (gate.isEmpty()) continue
-            val label = cleanText(a.text())
+            val label = cleanText(el.text())
             if (label.isEmpty()) continue
             val epMatch = Regex("\\(Ep\\s*(\\d+)(?:\\s*-\\s*(\\d+))?\\)", RegexOption.IGNORE_CASE).find(label)
-            val epStart = epMatch?.groupValues?.getOrNull(1)?.toIntOrNull()
+            val epStart = epMatch?.groupValues?.getOrNull(1)?.toIntOrNull() ?: currentEpStart
             val epEnd = epMatch?.groupValues?.getOrNull(2)?.toIntOrNull() ?: epStart
-            buttons.add(Btn(label, gate, epStart, epEnd))
+            val epName = if (epMatch != null) null else currentEpName
+            val groupKey = if (epMatch != null) null else currentGroupKey
+            buttons.add(Btn(label, gate, epStart, epEnd, epName, groupKey))
         }
         if (buttons.isEmpty()) return null
-        val isSeries = buttons.any { it.epStart != null } || isSeriesTitle(rawTitle, url)
+        val isSeries = buttons.any { it.epStart != null } || buttons.any { it.groupKey != null } || isSeriesTitle(rawTitle, url)
 
         fun entryFor(btn: Btn): LinkEntry {
             val size = Regex("(\\d+(\\.\\d+)?\\s*(GB|MB))").find(btn.label)?.groupValues?.getOrNull(1).orEmpty()
@@ -290,8 +334,28 @@ class SSRMoviesProvider : MainAPI() {
                 val links = epMap.getOrPut(key) { mutableListOf() }
                 val entry = entryFor(btn)
                 if (links.none { it.id == entry.id }) links.add(entry)
-                val name = if (end != start) "Episode $start-$end" else "Episode $start"
+                val name = btn.epName ?: if (end != start) "Episode $start-$end" else "Episode $start"
                 epNames[key] = name
+            }
+            // Dateless "Episode – <date>" groups (WWE weekly shows): number
+            // them oldest-first (last group on the page = lowest number) so
+            // earlier episodes keep their numbers when a new one is added
+            // at the top of the page. Numbered episodes keep their numbers;
+            // these start after the highest numbered episode.
+            val unnumbered = linkedMapOf<String, MutableList<LinkEntry>>()
+            for (btn in buttons) {
+                val key = btn.groupKey ?: continue
+                val links = unnumbered.getOrPut(key) { mutableListOf() }
+                val entry = entryFor(btn)
+                if (links.none { it.id == entry.id }) links.add(entry)
+            }
+            var nextEp = (epMap.keys.maxOrNull() ?: 0) + 1
+            for (key in unnumbered.keys.reversed()) {
+                val links = unnumbered[key] ?: continue
+                if (links.isEmpty()) continue
+                epMap[nextEp] = links
+                epNames[nextEp] = key
+                nextEp++
             }
             val episodes = mutableListOf<Episode>()
             for ((epNum, links) in epMap) {

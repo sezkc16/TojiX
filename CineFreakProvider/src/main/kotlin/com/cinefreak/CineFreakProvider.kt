@@ -85,15 +85,15 @@ class CineFreakProvider : MainAPI() {
     //   POST a=play -> JSON {url} (the R2 file).
     // All servers for one quality redirect to the SAME R2 file, so
     // loadLinks dedupes by final URL.
-    // CineCloud token = the ID part of the /f/ link ONLY (before the
-    // "_" suffix). The full href is /f/<id>_<suffix>, but a=play and
-    // /unlock accept ONLY the id — the full string returns 410 expired
-    // (found 2026-11-12: watch tokens work id-only, fail with suffix).
-    // load() strips the suffix with substringBefore("_").
+    // CineCloud token = the FULL string after /f/ (a base64url token;
+    // "_" is part of it, NOT a suffix separator). a=play and /unlock
+    // accept the full token (verified 2026-11-12: /unlock ok:true with
+    // full token; v4's substringBefore("_") CORRUPTED tokens like
+    // Z_4of4... to just "Z"). load() keeps the full token.
     data class LinkEntry(
         @JsonProperty("label") val label: String,  // e.g. "480p [370 MB]"
         @JsonProperty("host") val host: String,    // "dl" or "watch"
-        @JsonProperty("id") val id: String,        // CineCloud token id (after /f/, before _)
+        @JsonProperty("id") val id: String,        // CineCloud token (full, after /f/)
         @JsonProperty("q") val quality: Int,
     )
 
@@ -235,13 +235,13 @@ class CineFreakProvider : MainAPI() {
                 val links = mutableListOf<LinkEntry>()
                 val seenTokens = mutableSetOf<String>()
                 row.select("a.cfs-watch[href*=cinecloud.top/f/]").forEach { a ->
-                    val tok = a.attr("href").substringAfter("cinecloud.top/f/").substringBefore("/").substringBefore("?").substringBefore("_").trim()
+                    val tok = a.attr("href").substringAfter("cinecloud.top/f/").substringBefore("/").substringBefore("?").trim()
                     if (tok.isNotEmpty() && seenTokens.add("w:$tok")) {
                         links.add(LinkEntry("Watch $label", "watch", tok, Qualities.Unknown.value))
                     }
                 }
                 row.select("a.cfs-dl[href*=cinecloud.top/f/]").forEach { a ->
-                    val tok = a.attr("href").substringAfter("cinecloud.top/f/").substringBefore("/").substringBefore("?").substringBefore("_").trim()
+                    val tok = a.attr("href").substringAfter("cinecloud.top/f/").substringBefore("/").substringBefore("?").trim()
                     val q = a.selectFirst("b")?.text()?.trim() ?: a.text().trim()
                     if (tok.isNotEmpty() && seenTokens.add("d:$tok")) {
                         links.add(LinkEntry(q, "dl", tok, qualityValue(q)))
@@ -286,13 +286,13 @@ class CineFreakProvider : MainAPI() {
                 }
                 if (container == null) continue
                 container.select("a.dlbtn-download[href*=cinecloud.top/f/]").forEach { a ->
-                    val tok = a.attr("href").substringAfter("cinecloud.top/f/").substringBefore("/").substringBefore("?").substringBefore("_").trim()
+                    val tok = a.attr("href").substringAfter("cinecloud.top/f/").substringBefore("/").substringBefore("?").trim()
                     if (tok.isNotEmpty() && seenTokens.add("d:$tok")) {
                         links.add(LinkEntry(label, "dl", tok, q))
                     }
                 }
                 container.select("a.dlbtn-watch[href*=cinecloud.top/f/]").forEach { a ->
-                    val tok = a.attr("href").substringAfter("cinecloud.top/f/").substringBefore("/").substringBefore("?").substringBefore("_").trim()
+                    val tok = a.attr("href").substringAfter("cinecloud.top/f/").substringBefore("/").substringBefore("?").trim()
                     if (tok.isNotEmpty() && seenTokens.add("w:$tok")) {
                         links.add(LinkEntry(label, "watch", tok, q))
                     }

@@ -343,7 +343,7 @@ class SSRMoviesProvider : MainAPI() {
         val hubHtml = try { app.get(hubUrl, headers = browserHeaders).text } catch (e: Exception) {
             try { app.get("https://hubcloud.ist/drive/$hubCode", headers = browserHeaders).text } catch (e2: Exception) { return null }
         }
-        val gamerUrl = Regex("https?://gamerxyt\\.com/hubcloud\\.php\\?host=hubcloud&id=[A-Za-z0-9]+&token=<redacted>")
+        val gamerUrl = Regex("https?://gamerxyt\\.com/hubcloud\\.php\\?host=hubcloud&id=[A-Za-z0-9]+&token=[A-Za-z0-9]+")
             .find(hubHtml)?.value ?: return null
         val gamerHtml = try { app.get(gamerUrl, headers = browserHeaders).text } catch (e: Exception) { return null }
         Regex("https?://[^\"' ]+\\.r2\\.cloudflarestorage\\.com/[^\"' ]+")

@@ -224,31 +224,117 @@ class BollyFlixProvider : MainAPI() {
         }
     }
 
-    // Series detail: each part is an <h4>, e.g.
-    // "Ramayana (Season 1) Hindi Part 1 [550MB/E]", followed by an
-    // <a class="maxbutton-download-links" href="https://fxlinks.rest
-    // /elinks/<id>/">. Each fxlinks page lists per-episode fastdlserver
-    // links ("Episode 01".."Episode 25") + a "Season Zip" link.
-    // One HTTP fetch per part (same pattern as HiCine's per-group fetch).
+    // Series detail: TWO layouts exist on this site.
+    // (A) "Part" layout (e.g. Ramayana): each part is an <h4>, e.g.
+    //     "Ramayana (Season 1) Hindi Part 1 [550MB/E]", followed by an
+    //     <a class="maxbutton-download-links" href="https://fxlinks.rest
+    //     /elinks/<id>/">. Each fxlinks page lists per-episode fastdlserver
+    //     links ("Episode 01".."Episode 25") + a "Season Zip" link.
+    //     The part number becomes the CloudStream season.
+    // (B) Quality-group layout (e.g. VisionQuest): each group is an <h4>,
+    //     e.g. "VisionQuest (Season 1) {Hindi-English} 480p [150MB/E]",
+    //     followed by its own maxbutton-download-links button. Every
+    //     quality group links to ONE fxlinks page listing ALL episodes
+    //     (Episode 01..08) for that quality. Episodes are therefore
+    //     merged by episode number across the quality groups, so one
+    //     episode carries every quality variant (same pattern as
+    //     SSRMovies). The season is parsed from the title ("Season 1").
+    // One HTTP fetch per group (same pattern as HiCine's per-group fetch).
     private suspend fun loadSeries(title: String, url: String, doc: org.jsoup.nodes.Document, poster: String?): LoadResponse? {
         val episodes = mutableListOf<Episode>()
+        val season = Regex("(?i)Season\\s*(\\d+)").find(title)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
+        // Quality-group layout: episode number -> all quality variants.
+        val byEpisode = sortedMapOf<Int, MutableList<LinkEntry>>()
+        val seasonZips = mutableListOf<LinkEntry>()
         var currentPart: Int? = null
+        var currentQuality: Pair<String, Int>? = null
         for (el in doc.select("h4, a.maxbutton-download-links")) {
             if (el.tagName() == "h4") {
                 val text = cleanText(el.text())
                 currentPart = Regex("(?i)Part\\s*(\\d+)").find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                if (currentPart != null) {
+                    currentQuality = null
+                } else {
+                    val qMatch = Regex("(?i)(2160|1080|720|480)p").find(text)
+                    if (qMatch != null) {
+                        val qualityToken = qMatch.value
+                        val size = Regex("\\[([0-9.]+ ?[GM]B)").find(text)?.groupValues?.getOrNull(1) ?: ""
+                        var label = if (size.isNotEmpty()) "$qualityToken [$size]" else qualityToken
+                        if (text.contains("10bit", true)) {
+                            label = if (size.isNotEmpty()) "$qualityToken 10bit [$size]" else "$qualityToken 10bit"
+                        }
+                        currentQuality = label to qualityValue(qualityToken)
+                    } else {
+                        currentQuality = null
+                    }
+                }
             } else {
                 val fxUrl = el.attr("href")
-                val part = currentPart ?: continue
                 if (fxUrl.isEmpty()) continue
                 if (!fxUrl.contains("fxlinks.")) continue
-                fetchFxlinksPart(fxUrl, part, episodes, poster)
+                val part = currentPart
+                if (part != null) {
+                    fetchFxlinksPart(fxUrl, part, episodes, poster)
+                } else {
+                    val quality = currentQuality ?: continue
+                    fetchFxlinksQuality(fxUrl, quality.first, quality.second, byEpisode, seasonZips)
+                }
             }
+        }
+        // Merge the quality-group episodes: one per episode number,
+        // carrying every quality variant in its link list.
+        for ((epNum, links) in byEpisode) {
+            val dataJson = toJson(EpisodeData(links = links)) ?: continue
+            episodes.add(newEpisode(dataJson) {
+                this.name = "Episode $epNum"
+                this.episode = epNum
+                this.season = season
+                this.posterUrl = poster
+            })
+        }
+        // One "Season Zip" episode per quality that offered one.
+        for (zip in seasonZips) {
+            val dataJson = toJson(EpisodeData(links = listOf(zip))) ?: continue
+            episodes.add(newEpisode(dataJson) {
+                this.name = "Season Zip – ${zip.label.substringBefore(" Season Zip")}"
+                this.season = season
+                this.posterUrl = poster
+            })
         }
         if (episodes.isEmpty()) return null
         episodes.sortWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
             this.posterUrl = poster
+        }
+    }
+
+    // Fetch one quality group's fxlinks page and merge its per-episode
+    // fastdlserver links into byEpisode (keyed by episode number), so
+    // each episode accumulates every quality variant. A "Season Zip"
+    // link is kept separately (one per quality group).
+    private suspend fun fetchFxlinksQuality(
+        fxUrl: String,
+        label: String,
+        q: Int,
+        byEpisode: MutableMap<Int, MutableList<LinkEntry>>,
+        seasonZips: MutableList<LinkEntry>,
+    ) {
+        val html = try {
+            app.get(fxUrl, headers = browserHeaders).text
+        } catch (e: Exception) { return }
+        val doc = Jsoup.parse(html)
+        for (a in doc.select("a[href*=fastdlserver]")) {
+            val href = a.attr("href")
+            if (href.isEmpty()) continue
+            val text = cleanText(a.text())
+            val epMatch = Regex("(?i)Episode\\s*0*(\\d+)").find(text)
+            if (epMatch != null) {
+                val epNum = epMatch.groupValues[1].toIntOrNull() ?: continue
+                byEpisode.getOrPut(epNum) { mutableListOf() }
+                    .add(LinkEntry(label, "fastdl", href, q))
+            } else if (text.contains("Season Zip", true)) {
+                seasonZips.add(LinkEntry("$label Season Zip", "fastdl", href, q))
+            }
         }
     }
 

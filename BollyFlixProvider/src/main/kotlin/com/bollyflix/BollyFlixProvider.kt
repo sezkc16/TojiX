@@ -240,6 +240,7 @@ class BollyFlixProvider : MainAPI() {
     //     episode carries every quality variant (same pattern as
     //     SSRMovies). The season is parsed from the title ("Season 1").
     // One HTTP fetch per group (same pattern as HiCine's per-group fetch).
+    // Series pages group downloads by QUALITY (h4 "… 480p [150MB/E]"), not by "Part N" — e.g. VisionQuest (2026-11-12).
     private suspend fun loadSeries(title: String, url: String, doc: org.jsoup.nodes.Document, poster: String?): LoadResponse? {
         val episodes = mutableListOf<Episode>()
         val season = Regex("(?i)Season\\s*(\\d+)").find(title)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1

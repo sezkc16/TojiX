@@ -222,10 +222,10 @@ class HDHub4uProvider : MainAPI() {
             // outside its 40-char lookahead), so handle them here with
             // anchor text instead of a raw context window.
             val season = Regex("(?i)Season\\s*(\\d+)").find(title)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
-            val usedIds = mutableSetOf<String>()
+            val pass2UsedIds = mutableSetOf<String>()
             for (ep in episodes) {
                 val d = tryParseJson<EpisodeData>(ep.data) ?: continue
-                d.links?.forEach { usedIds.add(it.id) }
+                d.links?.forEach { pass2UsedIds.add(it.id) }
             }
             val usedGm = mutableSetOf<String>()
             // (a) EP packs -> per-episode entries, merged by episode
@@ -239,7 +239,7 @@ class HDHub4uProvider : MainAPI() {
                     if (!packUrl.startsWith("http")) packUrl = "https://hubdrive.blog$packUrl"
                     val btnText = cleanTitle(a.text())
                     val qToken = Regex("(?i)(2160|1080|720|480)p").find(btnText)?.value ?: continue
-                    fetchHubDrivePack(packUrl, qToken, byEpisode, usedIds)
+                    fetchHubDrivePack(packUrl, qToken, byEpisode, pass2UsedIds)
                 }
                 for ((epNum, links) in byEpisode) {
                     val dataJson = toJson(EpisodeData(links = links)) ?: continue
@@ -255,10 +255,10 @@ class HDHub4uProvider : MainAPI() {
             for (a in doc.select("a[href*=hubdrive.blog/file/]")) {
                 val href = a.attr("href")
                 val id = href.substringAfter("hubdrive.blog/file/").substringBefore("/").substringBefore("?").trim()
-                if (id.isEmpty() || id in usedIds) continue
+                if (id.isEmpty() || id in pass2UsedIds) continue
                 val txt = cleanTitle(a.text())
                 if (txt.isEmpty()) continue
-                usedIds.add(id)
+                pass2UsedIds.add(id)
                 val dataJson = toJson(EpisodeData(links = listOf(LinkEntry(txt, "hubdrive", id, qualityValue(txt))))) ?: continue
                 episodes.add(newEpisode(dataJson) {
                     this.name = txt

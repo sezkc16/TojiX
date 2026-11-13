@@ -332,27 +332,115 @@ class MoviesDriveProvider : MainAPI() {
     // IS a playable video file. NOTE: the page lists several Pixeldrain
     // links and some are DEAD (404), so validate each with a HEAD request
     // and return the first that actually exists.
-    private suspend fun resolveHubCloudDirect(hubCode: String): String? {
+    // One resolved HubCloud server: the actual server name (FSL, FSLv2,
+    // PixelDrain, 10G) + its direct playable file URL. The gamerxyt page
+    // lists one button per server; each becomes its own source in the app
+    // so the user sees WHICH server a link is instead of "HubCloud" on
+    // every row.
+    data class HubServer(
+        val server: String,
+        val url: String,
+    )
+
+    // FSL/FSLv2 button href: usually the R2 file URL (playable as-is).
+    // When it is NOT an R2 URL, the page's own JS appends '1' + the
+    // current minute to the href before the user clicks — mimic that.
+    private fun fslUrl(href: String): String {
+        if (href.contains("r2.cloudflarestorage.com")) return href
+        val minute = java.util.Calendar.getInstance().get(java.util.Calendar.MINUTE)
+        return href + "1" + minute
+    }
+
+    // Resolve the 10Gbps pixel link to the direct Google video file.
+    // Chain: pixel.hubcloud.pw/?id=<token> -> 302 workers.dev
+    // -> 302 cryptonewz.online/dl.php?link=<googleusercontent URL>.
+    // The workers.dev hop is flaky (HTTP 500) — any failure just skips
+    // 10G for this file, it never breaks the other servers.
+    private suspend fun resolvePixel10G(pixelUrl: String): String? {
+        return try {
+            val hop1 = app.get(pixelUrl, headers = browserHeaders, allowRedirects = false)
+            val workersUrl = hop1.headers["Location"] ?: hop1.headers["location"] ?: return null
+            if (!workersUrl.startsWith("http")) return null
+            val hop2 = app.get(workersUrl, headers = browserHeaders, allowRedirects = false)
+            val dlUrl = hop2.headers["Location"] ?: hop2.headers["location"] ?: return null
+            val linkParam = Regex("[?&]link=([^&]+)").find(dlUrl)?.groupValues?.getOrNull(1) ?: return null
+            val gu = java.net.URLDecoder.decode(linkParam, "UTF-8").trim()
+            if (!gu.startsWith("https://video-downloads.googleusercontent.com/")) return null
+            val head = try { app.head(gu, headers = browserHeaders) } catch (e: Exception) { return null }
+            if (head.code != 200) return null
+            val ct = head.headers["Content-Type"] ?: head.headers["content-type"] ?: ""
+            if (ct.isNotEmpty() && !ct.startsWith("video/") && !ct.startsWith("application/octet-stream")) return null
+            gu
+        } catch (e: Exception) { null }
+    }
+
+    // Resolve a HubCloud file id to one entry PER SERVER on the gamerxyt
+    // page (FSL, FSLv2, PixelDrain, 10G), each with its direct file URL.
+    // Buttons look like: <a href="..." ...>Download [FSL Server]</a>.
+    // - FSL / FSLv2: the button href IS the R2 file URL (playable).
+    //   R2 is NOT HEAD-checked: HEAD returns 403, but ranged GETs play.
+    // - PixelServer: pixeldrain.dev/u/<id> -> api/file/<id>, HEAD-checked
+    //   because some Pixeldrain links are DEAD (404).
+    // - 10Gbps: pixel chain -> Google video file (see resolvePixel10G).
+    // - Buzz Server (fuckingfast.net) is a download page, not a stream.
+    // If no PixelDrain came from a button, the first working Pixeldrain
+    // mirror from the page is added (the button's file is often dead
+    // while another mirror is alive). FALLBACK: if no server at all
+    // parsed, the old behaviour — first R2 URL as a single "HubCloud"
+    // entry — so playback never breaks.
+    private suspend fun resolveHubCloudServers(hubCode: String): List<HubServer> {
         val hubUrl = "https://hubcloud.ist/drive/$hubCode"
-        val hubHtml = try { app.get(hubUrl, headers = browserHeaders).text } catch (e: Exception) { return null }
+        val hubHtml = try { app.get(hubUrl, headers = browserHeaders).text } catch (e: Exception) { return emptyList() }
         val gamerUrl = Regex("https?://gamerxyt\\.com/hubcloud\\.php\\?host=hubcloud&id=[A-Za-z0-9]+&token=[A-Za-z0-9]+")
-            .find(hubHtml)?.value ?: return null
-        val gamerHtml = try { app.get(gamerUrl, headers = browserHeaders).text } catch (e: Exception) { return null }
-        // 1) Direct file: https://<hash>.r2.cloudflarestorage.com/hub/<hash>?X-Amz-...
-        Regex("https?://[^\"' ]+\\.r2\\.cloudflarestorage\\.com/[^\"' ]+")
-            .find(gamerHtml)?.value?.let { return it }
-        // 2) Pixeldrain page links -> direct API file URLs; try each until
-        // one actually exists (HEAD 200), because some are dead (404).
-        val pdIds = Regex("https?://pixeldrain\\.dev/u/([A-Za-z0-9]+)")
-            .findAll(gamerHtml).map { it.groupValues[1] }.distinct().toList()
-        for (id in pdIds) {
-            val apiUrl = "https://pixeldrain.dev/api/file/$id"
-            val ok = try {
-                app.head(apiUrl, headers = browserHeaders).code == 200
-            } catch (e: Exception) { false }
-            if (ok) return apiUrl
+            .find(hubHtml)?.value ?: return emptyList()
+        val gamerHtml = try { app.get(gamerUrl, headers = browserHeaders).text } catch (e: Exception) { return emptyList() }
+        val out = mutableListOf<HubServer>()
+        val seen = mutableSetOf<String>()
+        fun add(server: String, url: String) {
+            val u = url.trim()
+            if (u.isNotEmpty() && seen.add(u)) out.add(HubServer(server, u))
         }
-        return null
+        val btnRe = Regex("<a\\s+href=\"([^\"]+)\"[^>]*>\\s*(?:<i[^>]*></i>\\s*)?Download \\[([^\\]]+)\\]")
+        for (m in btnRe.findAll(gamerHtml)) {
+            val href = m.groupValues[1].trim()
+            val label = m.groupValues[2].trim()
+            when {
+                label.contains("FSLv2", ignoreCase = true) -> add("FSLv2", fslUrl(href))
+                label.contains("FSL", ignoreCase = true) -> add("FSL", fslUrl(href))
+                label.contains("Pixel", ignoreCase = true) -> {
+                    val id = Regex("pixeldrain\\.dev/u/([A-Za-z0-9]+)").find(href)?.groupValues?.getOrNull(1) ?: continue
+                    val apiUrl = "https://pixeldrain.dev/api/file/$id"
+                    val ok = try {
+                        app.head(apiUrl, headers = browserHeaders).code == 200
+                    } catch (e: Exception) { false }
+                    if (ok) add("PixelDrain", apiUrl)
+                }
+                label.contains("10G", ignoreCase = true) -> {
+                    resolvePixel10G(href)?.let { add("10G", it) }
+                }
+                else -> { /* Buzz Server and unknown hosts: not a direct stream, skip */ }
+            }
+        }
+        // The PixelServer button can point at a DEAD Pixeldrain file while
+        // another mirror on the same page is alive — if no PixelDrain came
+        // from a button, take the first working one from the page.
+        if (out.none { it.server == "PixelDrain" }) {
+            val pdIds = Regex("https?://pixeldrain\\.dev/u/([A-Za-z0-9]+)")
+                .findAll(gamerHtml).map { it.groupValues[1] }.distinct().toList()
+            for (id in pdIds) {
+                val apiUrl = "https://pixeldrain.dev/api/file/$id"
+                val ok = try {
+                    app.head(apiUrl, headers = browserHeaders).code == 200
+                } catch (e: Exception) { false }
+                if (ok) { add("PixelDrain", apiUrl); break }
+            }
+        }
+        if (out.isNotEmpty()) return out
+        // Fallback: old single-link behaviour (first R2 URL as "HubCloud").
+        // Pixeldrain is already covered above (as "PixelDrain").
+        Regex("https?://[^\"' ]+\\.r2\\.cloudflarestorage\\.com/[^\"' ]+")
+            .find(gamerHtml)?.value?.let { add("HubCloud", it); return out }
+        return out
     }
 
     private suspend fun emitHubCloud(
@@ -361,18 +449,26 @@ class MoviesDriveProvider : MainAPI() {
         quality: Int,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val direct = resolveHubCloudDirect(code) ?: return false
-        callback(
-            newExtractorLink(
-                source = "HubCloud",
-                name = "HubCloud $label",
-                url = direct,
-                type = ExtractorLinkType.VIDEO
-            ) {
-                this.quality = quality
-                this.referer = "https://hubcloud.pw/"
-            }
-        )
+        // One source per HubCloud server (FSL, FSLv2, PixelDrain, 10G)
+        // so the app shows WHICH server a link is. The server name is a
+        // plain word in the link name so the app's server chip can match it.
+        val servers = resolveHubCloudServers(code)
+        if (servers.isEmpty()) return false
+        for (server in servers) {
+            val name = if (server.server == "HubCloud") "HubCloud $label"
+                else "HubCloud ${server.server} $label"
+            callback(
+                newExtractorLink(
+                    source = "HubCloud",
+                    name = name,
+                    url = server.url,
+                    type = ExtractorLinkType.VIDEO
+                ) {
+                    this.quality = quality
+                    this.referer = "https://hubcloud.pw/"
+                }
+            )
+        }
         return true
     }
 

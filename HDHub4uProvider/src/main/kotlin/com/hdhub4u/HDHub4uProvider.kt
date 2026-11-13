@@ -26,6 +26,7 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.Jsoup
 
@@ -604,17 +605,41 @@ class HDHub4uProvider : MainAPI() {
     ): Boolean {
         val ep = tryParseJson<EpisodeData>(data) ?: return false
         var found = false
+        val entries = ep.links ?: return false
+
+        // One entry's pre-resolved links: HubCdn's direct file (if any)
+        // and the HubCloud servers (if any). Resolved CONCURRENTLY (see
+        // loadLinks): each entry costs several HTTP hops, and resolving
+        // them one after another (4K first, then 1080p) regularly blows
+        // the app's 30s loadLinks timeout, so 1080p never arrives.
+        // amap is CloudStream's own concurrent map (no kotlinx import
+        // needed — the gradle plugin does not expose kotlinx-coroutines
+        // to provider modules).
+        data class ResolvedEntry(
+            val hubCdn: String?,
+            val servers: List<HubServer>,
+        )
+
+        val resolved: List<ResolvedEntry> = entries.amap { entry ->
+            when (entry.host) {
+                "hubcdn" -> ResolvedEntry(resolveHubCdn(entry.id), emptyList())
+                "hubdrive" -> ResolvedEntry(null, resolveHubDrive(entry.id))
+                "gm" -> ResolvedEntry(null, resolveGmEntry(entry.id))
+                else -> ResolvedEntry(null, emptyList())
+            }
+        }
 
         // Resolve every link entry; the source name keeps the full button
         // text (with size) so the user can pick the highest, e.g.
-        // "HubCloud HQ 1080p (SOURCE) [32.8GB]".
-        ep.links?.forEach { entry ->
+        // "HubCloud HQ 1080p (SOURCE) [32.8GB]". Callbacks are emitted
+        // sequentially in page order, so the source list order is unchanged.
+        entries.zip(resolved).forEach { (entry, res) ->
             // HubCdn is a different host (hubcdn.club) with its own single
             // direct file — unchanged. HubCloud entries emit one source
             // per server (FSL, FSLv2, PixelDrain, 10G) so the app shows
             // WHICH server a link is.
             if (entry.host == "hubcdn") {
-                val direct = resolveHubCdn(entry.id) ?: return@forEach
+                val direct = res.hubCdn ?: return@forEach
                 callback(
                     newExtractorLink(
                         source = "HubCdn",
@@ -629,12 +654,7 @@ class HDHub4uProvider : MainAPI() {
                 found = true
                 return@forEach
             }
-            val servers = when (entry.host) {
-                "hubdrive" -> resolveHubDrive(entry.id)
-                "gm" -> resolveGmEntry(entry.id)
-                else -> emptyList()
-            }
-            for (server in servers) {
+            for (server in res.servers) {
                 val name = if (server.server == "HubCloud") "HubCloud ${entry.label}"
                     else "HubCloud ${server.server} ${entry.label}"
                 callback(

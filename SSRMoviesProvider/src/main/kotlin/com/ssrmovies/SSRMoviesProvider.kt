@@ -25,6 +25,7 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.Jsoup
 
@@ -516,56 +517,84 @@ class SSRMoviesProvider : MainAPI() {
     ): Boolean {
         val ep = tryParseJson<EpisodeData>(data) ?: return false
         var found = false
-        ep.links?.forEach { entry ->
-            if (entry.host != "lz") return@forEach
-            if (!entry.id.startsWith("http")) return@forEach
-            // The linkszilla gate (plain GET, follows a 302) lists the
-            // real hosts in its unlocked page HTML: HubCloud + GDFlix.
+        val entries = ep.links ?: return false
+
+        // One entry's pre-resolved gate: the HubCloud servers (if any),
+        // the GDFlix URL (if any) and the fallback stream URLs. Resolved
+        // CONCURRENTLY (see loadLinks): each entry costs a gate GET plus
+        // ~4-6 HubCloud hops, and resolving them one after another (4K
+        // first, then 1080p) regularly blows the app's 30s loadLinks
+        // timeout, so 1080p never arrives.
+        // amap is CloudStream's own concurrent map (no kotlinx import
+        // needed — the gradle plugin does not expose kotlinx-coroutines
+        // to provider modules).
+        data class ResolvedGate(
+            val servers: List<HubServer>,
+            val gdflixUrl: String?,
+            val streamUrls: List<String>,
+        )
+
+        val resolved: List<ResolvedGate> = entries.amap { entry ->
+            if (entry.host != "lz" || !entry.id.startsWith("http")) {
+                return@amap ResolvedGate(emptyList(), null, emptyList())
+            }
+            // The linkszilla gate (plain GET, follows a 302) lists
+            // the real hosts in its unlocked page HTML: HubCloud
+            // + GDFlix.
             val gateHtml = try {
                 app.get(entry.id, headers = browserHeaders).text
-            } catch (e: Exception) { return@forEach }
+            } catch (e: Exception) { return@amap ResolvedGate(emptyList(), null, emptyList()) }
+            // HubCloud (primary, proven): hubcloud.pw/drive/<code>.
+            val hubCode = Regex("hubcloud\\.pw/drive/([A-Za-z0-9]+)")
+                .find(gateHtml)?.groupValues?.getOrNull(1)
+            val servers = if (!hubCode.isNullOrEmpty()) resolveHubCloudServers(hubCode) else emptyList()
+            // GDFlix (best effort via the built-in extractors).
+            val gdflixUrl = Regex("https?://[^\"'\\s]*gdflix[^\"'\\s]*/file/[A-Za-z0-9]+")
+                .find(gateHtml)?.value
+            // Fallback stream hosts on the same gate page.
+            val streamUrls = listOf(
+                Regex("https?://watch-online\\.mom/e/[A-Za-z0-9]+").find(gateHtml)?.value,
+                Regex("https?://streamtape\\.com/v/[A-Za-z0-9]+").find(gateHtml)?.value,
+            ).filterNotNull().distinct()
+            ResolvedGate(servers, gdflixUrl, streamUrls)
+        }
+
+        // Callbacks are emitted sequentially in page order, so the source
+        // list order is unchanged.
+        entries.zip(resolved).forEach { (entry, res) ->
+            if (entry.host != "lz") return@forEach
+            if (!entry.id.startsWith("http")) return@forEach
             // HubCloud (primary, proven): hubcloud.pw/drive/<code>.
             // One source per server (FSL, FSLv2, PixelDrain, 10G) so the
             // app shows WHICH server a link is.
-            val hubCode = Regex("hubcloud\\.pw/drive/([A-Za-z0-9]+)")
-                .find(gateHtml)?.groupValues?.getOrNull(1)
-            if (!hubCode.isNullOrEmpty()) {
-                val servers = resolveHubCloudServers(hubCode)
-                for (server in servers) {
-                    val name = if (server.server == "HubCloud") "HubCloud ${entry.label}"
-                        else "HubCloud ${server.server} ${entry.label}"
-                    callback(
-                        newExtractorLink(
-                            source = "HubCloud",
-                            name = name,
-                            url = server.url,
-                            type = ExtractorLinkType.VIDEO
-                        ) {
-                            this.quality = entry.quality
-                            this.referer = "https://hubcloud.pw/"
-                        }
-                    )
-                    found = true
-                }
+            for (server in res.servers) {
+                val name = if (server.server == "HubCloud") "HubCloud ${entry.label}"
+                    else "HubCloud ${server.server} ${entry.label}"
+                callback(
+                    newExtractorLink(
+                        source = "HubCloud",
+                        name = name,
+                        url = server.url,
+                        type = ExtractorLinkType.VIDEO
+                    ) {
+                        this.quality = entry.quality
+                        this.referer = "https://hubcloud.pw/"
+                    }
+                )
+                found = true
             }
             // GDFlix (best effort via the built-in extractors; CF-403
             // from a VM, so unverified here — the phone test is the proof).
-            val gdflixUrl = Regex("https?://[^\"'\\s]*gdflix[^\"'\\s]*/file/[A-Za-z0-9]+")
-                .find(gateHtml)?.value
-            if (!gdflixUrl.isNullOrEmpty()) {
+            if (!res.gdflixUrl.isNullOrEmpty()) {
                 try {
-                    loadExtractor(gdflixUrl, subtitleCallback, callback)
+                    loadExtractor(res.gdflixUrl, subtitleCallback, callback)
                     found = true
                 } catch (e: Exception) { }
             }
             // Fallback stream hosts on the same gate page (best effort).
             // If HubCloud is unreachable from the phone, one of these
             // usually still resolves to a playable link.
-            val streamUrls = listOf(
-                Regex("https?://watch-online\\.mom/e/[A-Za-z0-9]+").find(gateHtml)?.value,
-                Regex("https?://streamtape\\.com/v/[A-Za-z0-9]+").find(gateHtml)?.value,
-            ).filterNotNull().distinct()
-            for (streamUrl in streamUrls) {
+            for (streamUrl in res.streamUrls) {
                 try {
                     loadExtractor(streamUrl, subtitleCallback, callback)
                     found = true

@@ -25,6 +25,7 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.Jsoup
 
@@ -443,16 +444,18 @@ class MoviesDriveProvider : MainAPI() {
         return out
     }
 
-    private suspend fun emitHubCloud(
-        code: String,
+    // Emit one source per pre-resolved HubCloud server (FSL, FSLv2,
+    // PixelDrain, 10G) so the app shows WHICH server a link is. The
+    // server name is a plain word in the link name so the app's server
+    // chip can match it. Emission only — the servers are resolved
+    // concurrently in loadLinks, so this never does network I/O (it
+    // stays suspend only because newExtractorLink is a suspend fun).
+    private suspend fun emitHubCloudServers(
         label: String,
         quality: Int,
+        servers: List<HubServer>,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // One source per HubCloud server (FSL, FSLv2, PixelDrain, 10G)
-        // so the app shows WHICH server a link is. The server name is a
-        // plain word in the link name so the app's server chip can match it.
-        val servers = resolveHubCloudServers(code)
         if (servers.isEmpty()) return false
         for (server in servers) {
             val name = if (server.server == "HubCloud") "HubCloud $label"
@@ -480,16 +483,43 @@ class MoviesDriveProvider : MainAPI() {
     ): Boolean {
         val ep = tryParseJson<EpisodeData>(data) ?: return false
         var found = false
+        val entries = ep.links ?: return false
 
-        ep.links?.forEach { entry ->
+        // Resolve every entry's HubCloud servers CONCURRENTLY: each one
+        // costs ~4-6 HTTP hops, and resolving them one after another (4K
+        // first, then 1080p) regularly blows the app's 30s loadLinks
+        // timeout, so 1080p never arrives. An "archive" entry expands to
+        // its sub-links first (one GET), and those subs resolve in
+        // parallel too. Callbacks are still emitted sequentially in page
+        // order afterwards, so the source list order is unchanged.
+        // Each resolved item is (sub-entry, its HubCloud servers);
+        // "gdflix" items resolve to no servers and are handled by
+        // loadExtractor in the emission phase, as before.
+        // amap is CloudStream's own concurrent map (no kotlinx import
+        // needed — the gradle plugin does not expose kotlinx-coroutines
+        // to provider modules).
+        val resolved: List<List<Pair<LinkEntry, List<HubServer>>>> = entries.amap { entry ->
+            when (entry.host) {
+                "archive" -> {
+                    val subs = fetchArchiveLinks(entry.id)
+                    subs.amap { sub ->
+                        sub to if (sub.host == "hubcloud") resolveHubCloudServers(sub.id) else emptyList()
+                    }
+                }
+                "hubcloud" -> listOf(entry to resolveHubCloudServers(entry.id))
+                else -> emptyList()
+            }
+        }
+
+        entries.zip(resolved).forEach { (entry, items) ->
             when (entry.host) {
                 "archive" -> {
                     // Fetch the mdrive archive page; it has one HubCloud
                     // + one GDFlix button. Keep the entry's own label
                     // (quality + size) on the emitted links.
-                    for (sub in fetchArchiveLinks(entry.id)) {
+                    for ((sub, servers) in items) {
                         when (sub.host) {
-                            "hubcloud" -> if (emitHubCloud(sub.id, entry.label, entry.quality, callback)) found = true
+                            "hubcloud" -> if (emitHubCloudServers(entry.label, entry.quality, servers, callback)) found = true
                             "gdflix" -> {
                                 if (loadExtractor("https://gdflix.vip/file/${sub.id}", subtitleCallback, callback)) found = true
                             }
@@ -497,7 +527,8 @@ class MoviesDriveProvider : MainAPI() {
                     }
                 }
                 "hubcloud" -> {
-                    if (emitHubCloud(entry.id, entry.label, entry.quality, callback)) found = true
+                    val servers = items.firstOrNull()?.second ?: emptyList()
+                    if (emitHubCloudServers(entry.label, entry.quality, servers, callback)) found = true
                 }
                 "gdflix" -> {
                     // Best effort: GDFlix is Cloudflare-guarded for plain

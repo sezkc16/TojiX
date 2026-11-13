@@ -26,6 +26,7 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.Jsoup
 
@@ -505,11 +506,24 @@ class FourKHDHubProvider : MainAPI() {
     ): Boolean {
         val ep = tryParseJson<EpisodeData>(data) ?: return false
         var found = false
+        val entries = ep.links ?: return false
+
+        // Resolve every "gm" entry CONCURRENTLY: each one costs ~4-6 HTTP
+        // hops, and resolving them one after another (4K first, then
+        // 1080p) regularly blows the app's 30s loadLinks timeout, so
+        // 1080p never arrives. Callbacks are still emitted sequentially
+        // in page order afterwards, so the source list order is unchanged.
+        // amap is CloudStream's own concurrent map (no kotlinx import
+        // needed — the gradle plugin does not expose kotlinx-coroutines
+        // to provider modules).
+        val resolved: List<List<HubServer>> = entries.amap { entry ->
+            if (entry.host == "gm") resolveGmEntry(entry.id) else emptyList()
+        }
 
         // Resolve every link entry; the source name keeps the full quality
         // label (with size) so the user can pick the highest, e.g.
         // "HubCloud 2160p DV HDR [16.74 GB]".
-        ep.links?.forEach { entry ->
+        entries.zip(resolved).forEach { (entry, servers) ->
             when (entry.host) {
                 "videasy" -> {
                     // Watch Online player embed — best effort via the
@@ -525,7 +539,6 @@ class FourKHDHubProvider : MainAPI() {
                     // 10G) so the app shows WHICH server a link is. The
                     // server name is a plain word in the link name so the
                     // app's server chip can match it.
-                    val servers = resolveGmEntry(entry.id)
                     for (server in servers) {
                         val name = if (server.server == "HubCloud") "HubCloud ${entry.label}"
                             else "HubCloud ${server.server} ${entry.label}"

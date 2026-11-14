@@ -422,10 +422,14 @@ class FourKHDHubProvider : MainAPI() {
             .find(hubHtml)?.value ?: return emptyList()
         val gamerHtml = try { app.get(gamerUrl, headers = browserHeaders).text } catch (e: Exception) { return emptyList() }
         val out = mutableListOf<HubServer>()
-        val seen = mutableSetOf<String>()
+        // Dedup on (server, url): FSL and FSLv2 sometimes point at the
+        // same file URL — with URL-only dedup the second one was dropped
+        // and FSLv2 never showed. The same URL under a different server
+        // name is a different source row, so it must be kept.
+        val seen = mutableSetOf<Pair<String, String>>()
         fun add(server: String, url: String) {
             val u = url.trim()
-            if (u.isNotEmpty() && seen.add(u)) out.add(HubServer(server, u))
+            if (u.isNotEmpty() && seen.add(server to u)) out.add(HubServer(server, u))
         }
         val btnRe = Regex("<a\\s+href=\"([^\"]+)\"[^>]*>\\s*(?:<i[^>]*></i>\\s*)?Download \\[([^\\]]+)\\]")
         for (m in btnRe.findAll(gamerHtml)) {

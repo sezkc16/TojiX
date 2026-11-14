@@ -27,7 +27,7 @@ import org.jsoup.Jsoup
 
 class CineVoodProvider : MainAPI() {
 
-    override var mainUrl = "https://new2.cinevood.company"
+    override var mainUrl = "https://new1.cinevood.plus"
     override var name = "CineVood"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
     override var lang = "en"

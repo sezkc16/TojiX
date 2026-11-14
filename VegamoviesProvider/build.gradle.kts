@@ -1,5 +1,5 @@
 // Use an integer for version numbers
-version = 2
+version = 3
 
 cloudstream {
     description = "Download Movies & Web Series from Vegamovies"
@@ -15,7 +15,7 @@ cloudstream {
     status = 1
 
     tvTypes = listOf("Movie", "TvSeries")
-    iconUrl = "https://vegamovies8.co.in/templates/vegamovies/images/v-l-200x300.png"
+    iconUrl = "https://vegamovies12.co.in/templates/vegamovies/images/v-l-200x300.png"
 
     isCrossPlatform = true
 }

@@ -1,5 +1,5 @@
 // Use an integer for version numbers
-version = 2
+version = 3
 
 cloudstream {
     description = "Download HD Movies & TV Shows from CineVood"
@@ -15,7 +15,7 @@ cloudstream {
     status = 1
 
     tvTypes = listOf("Movie", "TvSeries")
-    iconUrl = "https://new2.cinevood.company/wp-content/uploads/2020/07/favicon2.png"
+    iconUrl = "https://new1.cinevood.plus/wp-content/uploads/2020/07/favicon2.png"
 
     isCrossPlatform = true
 }

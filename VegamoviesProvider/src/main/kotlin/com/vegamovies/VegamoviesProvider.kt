@@ -28,7 +28,7 @@ import org.jsoup.Jsoup
 
 class VegamoviesProvider : MainAPI() {
 
-    override var mainUrl = "https://vegamovies8.co.in"
+    override var mainUrl = "https://vegamovies12.co.in"
     override var name = "Vegamovies"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
     override var lang = "en"

@@ -12,6 +12,7 @@ import com.lagradost.cloudstream3.SearchResponseList
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.mainPageOf
 import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
@@ -275,7 +276,9 @@ class Movies4uProvider : MainAPI() {
 
     // ---- Host collection on an mdisk (NEX DRIVE) page segment ----
     // Hosts per segment: HubCloud, GDFlix, G-Direct (fastdl), Filepress,
-    // V-Cloud, V-Drive. Returns one LinkEntry per host occurrence.
+    // V-Cloud, V-Drive, plus the mirror hosts (GoFile, MegaUp, 1Fichier,
+    // VikingFile) which the built-in loadExtractor handles. Returns one
+    // LinkEntry per host occurrence.
     private fun collectHostLinks(html: String, labelPrefix: String, quality: Int): List<LinkEntry> {
         val out = mutableListOf<LinkEntry>()
         val seen = mutableSetOf<String>()
@@ -302,6 +305,22 @@ class Movies4uProvider : MainAPI() {
         for (m in Regex("https?://one\\.vegadrive\\.app/s/([A-Za-z0-9]+)").findAll(html)) {
             val u = m.value
             if (seen.add("vd:$u")) out.add(LinkEntry("$labelPrefix V-Drive".trim(), "vdrive", u, quality))
+        }
+        // Mirror hosts (same set GokuHD collects from nexdrive pages):
+        // the built-in loadExtractor resolves the ones it knows
+        // (GoFile etc.) and returns false fast for the rest, so a
+        // variant with no G-Direct — e.g. Vibe 1080p HQ — can still
+        // get a row from a mirror instead of nothing.
+        for (m in Regex("https?://(?:1fichier\\.com/\\?[A-Za-z0-9]+|gofile\\.io/d/[A-Za-z0-9]+|megaup\\.net/[A-Za-z0-9]+/[^\"'\\s]+|vikingfile\\.com/f/[A-Za-z0-9]+)").findAll(html)) {
+            val u = m.value
+            val hostLabel = when {
+                u.contains("1fichier") -> "1Fichier"
+                u.contains("gofile") -> "GoFile"
+                u.contains("megaup") -> "MegaUp"
+                u.contains("vikingfile") -> "VikingFile"
+                else -> "Mirror"
+            }
+            if (seen.add("ex:$u")) out.add(LinkEntry("$labelPrefix $hostLabel".trim(), "extractor", u, quality))
         }
         return out
     }
@@ -445,29 +464,57 @@ class Movies4uProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val ep = tryParseJson<EpisodeData>(data) ?: return false
+        val entries = ep.links ?: return false
         var found = false
 
-        ep.links?.forEach { entry ->
-            when (entry.host) {
-                "mdisk" -> {
-                    // Movie quality: fetch the mdisk page, then resolve
-                    // every host on it (G-Direct / V-Cloud / V-Drive /
-                    // Filepress).
-                    // The id is the full mdisk URL (see load()); fall
-                    // back to the old .cloud URL for legacy numeric ids.
-                    val mdUrl = if (entry.id.startsWith("http")) entry.id
-                        else "https://mdrive.cloud/mdisk/${entry.id}"
-                    val mdHtml = try {
-                        app.get(mdUrl, headers = browserHeaders).text
-                    } catch (e: Exception) { return@forEach }
-                    val hostLinks = collectHostLinks(mdHtml, entry.label, entry.quality)
-                    for (hl in hostLinks) {
-                        if (resolveEntry(hl, subtitleCallback, callback)) found = true
-                    }
-                }
-                else -> {
-                    if (resolveEntry(entry, subtitleCallback, callback)) found = true
-                }
+        // Stage 1 — fetch every mdisk page CONCURRENTLY. The old code
+        // fetched them one after another, and Stage 2 resolved every
+        // host on a page before touching the next variant: 4 variants
+        // x (mdisk ~2s + G-Direct ~3s + FilePress/V-Cloud/V-Drive
+        // extractors ~3-8s each) = 45-90s of serial HTTP, way past
+        // the app's 30s loadLinks timeout. On Vibe only the first two
+        // G-Direct rows (480p, 720p) ever arrived — 1080p never did.
+        // amap is CloudStream's own concurrent map (no kotlinx import
+        // needed — the gradle plugin does not expose kotlinx-coroutines
+        // to provider modules). Same pattern as the 1080p parallel
+        // fix in 4KHDHub v3 / HDHub4u v7 / MoviesDrive v3 / SSRMovies v7.
+        val hostGroups: List<List<LinkEntry>> = entries.amap { entry ->
+            if (entry.host == "mdisk") {
+                // Movie quality: fetch the mdisk page, then resolve
+                // every host on it (G-Direct / HubCloud / V-Cloud /
+                // V-Drive / Filepress / mirrors).
+                // The id is the full mdisk URL (see load()); fall
+                // back to the old .cloud URL for legacy numeric ids.
+                val mdUrl = if (entry.id.startsWith("http")) entry.id
+                    else "https://mdrive.cloud/mdisk/${entry.id}"
+                val mdHtml = try {
+                    app.get(mdUrl, headers = browserHeaders).text
+                } catch (e: Exception) { return@amap emptyList<LinkEntry>() }
+                collectHostLinks(mdHtml, entry.label, entry.quality)
+            } else {
+                listOf(entry)
+            }
+        }
+
+        // Stage 2 — resolve every host link CONCURRENTLY, collecting
+        // the ExtractorLinks instead of emitting them, so a slow host
+        // (FilePress / V-Cloud / V-Drive / GoFile mirrors) can never
+        // block the fast G-Direct rows of the next quality. amap
+        // preserves input order, so the flattened list stays in page
+        // order and the callbacks below emit in the same order as
+        // before — the source list order is unchanged.
+        val resolved: List<List<ExtractorLink>> = hostGroups.flatten().amap { hl ->
+            val out = mutableListOf<ExtractorLink>()
+            try {
+                resolveEntry(hl, subtitleCallback) { out.add(it) }
+            } catch (e: Exception) { }
+            out
+        }
+
+        for (links in resolved) {
+            for (link in links) {
+                callback(link)
+                found = true
             }
         }
 
@@ -520,7 +567,7 @@ class Movies4uProvider : MainAPI() {
             "gdflix" -> {
                 loadExtractor("https://gdflix.vip/file/${entry.id}", subtitleCallback, callback)
             }
-            "filepress", "vcloud", "vdrive" -> {
+            "filepress", "vcloud", "vdrive", "extractor" -> {
                 loadExtractor(entry.id, subtitleCallback, callback)
             }
             else -> false

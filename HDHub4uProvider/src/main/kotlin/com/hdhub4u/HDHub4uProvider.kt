@@ -75,6 +75,31 @@ class HDHub4uProvider : MainAPI() {
         }
     }
 
+    // HubCloud moved from hubcloud.pw to hubcloud.mov (verified live
+    // 2026-11-15: hubdrive.blog pages now link hubcloud.mov/drive/<code>,
+    // zero hubcloud.pw links anywhere). Accept any hubcloud TLD so the
+    // next move does not break resolution again.
+    private fun hubCloudCode(text: String): String? {
+        return Regex("hubcloud\\.[a-z]+/drive/([A-Za-z0-9]+)").find(text)?.groupValues?.getOrNull(1)
+    }
+
+    // The page's Storyline section:
+    // <div class="kno-rdesc"><span><em><strong>Title : </strong></em></span>Synopsis text</div>
+    // The provider never set a description, so the detail page showed
+    // "No description available." The Review section has a second
+    // kno-rdesc ("N/A Please Watch...") — skipped by the filters below.
+    private fun parseDescription(doc: org.jsoup.nodes.Document): String? {
+        for (el in doc.select("div.kno-rdesc")) {
+            val copy = el.clone()
+            copy.select("strong").remove()
+            val text = cleanTitle(copy.text())
+            if (text.length >= 40 && !text.startsWith("N/A") && !text.contains("Please Watch", ignoreCase = true)) {
+                return text
+            }
+        }
+        return null
+    }
+
     private fun toJson(data: EpisodeData): String? {
         return try {
             com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(data)
@@ -160,6 +185,7 @@ class HDHub4uProvider : MainAPI() {
             .trim()
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
             ?: doc.selectFirst("div.post-content img, article img, .post img")?.attr("src")
+        val description = parseDescription(doc)
         val isSeries = url.contains("-full-series/") || title.contains("Season", true)
 
         if (isSeries) {
@@ -289,6 +315,7 @@ class HDHub4uProvider : MainAPI() {
             if (episodes.isEmpty()) return null
             return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
                 this.posterUrl = poster
+                this.plot = description
             }
         } else {
             // Movie: collect EVERY quality download link (hubcdn + hubdrive),
@@ -317,12 +344,21 @@ class HDHub4uProvider : MainAPI() {
                             links.add(LinkEntry(txt, "hubdrive", id, qualityValue(txt)))
                         }
                     }
+                    href.contains("greenmotors.club") -> {
+                        // 10Bit / x264 variants (e.g. "1080p 10Bit HEVC [3GB]").
+                        // Resolved by resolveGmEntry (host "gm"); loadLinks
+                        // already handles it (series use it too).
+                        if (seenIds.add("gm:$href")) {
+                            links.add(LinkEntry(txt, "gm", href, qualityValue(txt)))
+                        }
+                    }
                 }
             }
             if (links.isEmpty()) return null
             val dataJson = toJson(EpisodeData(links = links)) ?: return null
             return newMovieLoadResponse(title, url, TvType.Movie, dataJson) {
                 this.posterUrl = poster
+                this.plot = description
             }
         }
     }
@@ -438,14 +474,12 @@ class HDHub4uProvider : MainAPI() {
     // Resolve one greenmotors button to the direct video file(s) — one
     // entry per HubCloud server, so each server shows as its own source.
     // HDHub4u series tokens decode to an hblinks.lol page, which lists
-    // a hubcloud.pw/drive/<code> (preferred) or hubdrive.blog/file/<id>.
+    // a hubcloud.<tld>/drive/<code> (preferred) or hubdrive.blog/file/<id>.
     private suspend fun resolveGmEntry(gmUrl: String): List<HubServer> {
         val target = resolveGreenMotors(gmUrl) ?: return emptyList()
+        // Direct HubCloud target (any TLD — hubcloud.pw moved to .mov).
+        hubCloudCode(target)?.let { return resolveHubCloudServers(it) }
         return when {
-            target.contains("hubcloud.pw/drive/") -> {
-                val code = target.substringAfter("hubcloud.pw/drive/").substringBefore("/").substringBefore("?").trim()
-                if (code.isEmpty()) emptyList() else resolveHubCloudServers(code)
-            }
             target.contains("hubdrive.blog/file/") -> {
                 val id = target.substringAfter("hubdrive.blog/file/").substringBefore("/").substringBefore("?").trim()
                 if (id.isEmpty()) emptyList() else resolveHubDrive(id)
@@ -454,7 +488,7 @@ class HDHub4uProvider : MainAPI() {
                 val html = try {
                     app.get(target, headers = browserHeaders).text
                 } catch (e: Exception) { return emptyList() }
-                val code = Regex("hubcloud\\.pw/drive/([A-Za-z0-9]+)").find(html)?.groupValues?.getOrNull(1)
+                val code = hubCloudCode(html)
                 if (code != null) return resolveHubCloudServers(code)
                 val fid = Regex("hubdrive\\.blog/file/(\\d+)").find(html)?.groupValues?.getOrNull(1)
                 if (fid != null) return resolveHubDrive(fid)
@@ -480,13 +514,13 @@ class HDHub4uProvider : MainAPI() {
         return decoded.removePrefix("link=").trim().takeIf { it.startsWith("http") }
     }
 
-    // hubdrive.blog/file/<id> -> HubDrive page with a hubcloud.pw/drive/<code>
+    // hubdrive.blog/file/<id> -> HubDrive page with a hubcloud.<tld>/drive/<code>
     // link, resolved by the same HubCloud chain as KatDrama.
     private suspend fun resolveHubDrive(fileId: String): List<HubServer> {
         val html = try {
             app.get("https://hubdrive.blog/file/$fileId", headers = browserHeaders).text
         } catch (e: Exception) { return emptyList() }
-        val code = Regex("hubcloud\\.pw/drive/([A-Za-z0-9]+)").find(html)?.groupValues?.getOrNull(1) ?: return emptyList()
+        val code = hubCloudCode(html) ?: return emptyList()
         return resolveHubCloudServers(code)
     }
 

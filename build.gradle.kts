@@ -10,6 +10,10 @@ buildscript {
         // GitHub Actions runners (HTTP 429), which broke the build 2026-11-15.
         // The mirror is a complete copy of Maven Central.
         maven("https://maven-central.storage-download.googleapis.com/maven2")
+        // Vendored CloudStream gradle plugin + jadb (libs/m2) — JitPack is
+        // unreachable from GitHub Actions runners (Cloudflare challenge),
+        // so the plugin resolves locally instead. Keep jitpack as fallback.
+        maven { url = uri("libs/m2") }
         // Shitpack repo which contains our tools and dependencies
         maven("https://jitpack.io")
     }
@@ -27,6 +31,8 @@ allprojects {
         google()
         // Google mirror of Maven Central (see buildscript above — repo.maven.apache.org 429s GitHub Actions runners)
         maven("https://maven-central.storage-download.googleapis.com/maven2")
+        // Vendored plugin artifacts (see buildscript above)
+        maven { url = uri("libs/m2") }
         maven("https://jitpack.io")
     }
 }

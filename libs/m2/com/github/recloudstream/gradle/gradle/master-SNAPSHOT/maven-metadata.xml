@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<metadata modelVersion="1.0.0">
+    <groupId>com.github.recloudstream.gradle</groupId>
+    <artifactId>gradle</artifactId>
+    <version>master-32895aedb6-1</version>
+    <versioning>
+        <snapshot>
+            <timestamp>32895aedb6</timestamp>
+            <buildNumber>1</buildNumber>
+        </snapshot>
+    </versioning>
+</metadata>

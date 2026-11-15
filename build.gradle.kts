@@ -6,7 +6,10 @@ import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 buildscript {
     repositories {
         google()
-        mavenCentral()
+        // Google mirror of Maven Central — repo.maven.apache.org rate-limits
+        // GitHub Actions runners (HTTP 429), which broke the build 2026-11-15.
+        // The mirror is a complete copy of Maven Central.
+        maven("https://maven-central.storage-download.googleapis.com/maven2")
         // Shitpack repo which contains our tools and dependencies
         maven("https://jitpack.io")
     }
@@ -22,7 +25,8 @@ buildscript {
 allprojects {
     repositories {
         google()
-        mavenCentral()
+        // Google mirror of Maven Central (see buildscript above — repo.maven.apache.org 429s GitHub Actions runners)
+        maven("https://maven-central.storage-download.googleapis.com/maven2")
         maven("https://jitpack.io")
     }
 }

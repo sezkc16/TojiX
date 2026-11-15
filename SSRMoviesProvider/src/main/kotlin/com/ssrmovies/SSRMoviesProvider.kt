@@ -470,7 +470,10 @@ class SSRMoviesProvider : MainAPI() {
             val u = url.trim()
             if (u.isNotEmpty() && seen.add(server to u)) out.add(HubServer(server, u))
         }
-        val btnRe = Regex("<a\\s+href=\"([^\"]+)\"[^>]*>\\s*(?:<i[^>]*></i>\\s*)?Download \\[([^\\]]+)\\]")
+        // Lenient on purpose: gamerxyt's buttons carry an <i> icon (and
+        // sometimes extra attrs/whitespace) between <a> and "Download".
+        // A strict regex matches 0 buttons and only the fallback row shows.
+        val btnRe = Regex("<a[^>]*?href=\"([^\"]+)\"[^>]*>\\s*(?:<[^>]+>\\s*){0,3}Download\\s*\\[([^\\]]+)\\]")
         for (m in btnRe.findAll(gamerHtml)) {
             val href = m.groupValues[1].trim()
             val label = m.groupValues[2].trim()
@@ -548,8 +551,10 @@ class SSRMoviesProvider : MainAPI() {
             val gateHtml = try {
                 app.get(entry.id, headers = browserHeaders).text
             } catch (e: Exception) { return@amap ResolvedGate(emptyList(), null, emptyList()) }
-            // HubCloud (primary, proven): hubcloud.pw/drive/<code>.
-            val hubCode = Regex("hubcloud\\.pw/drive/([A-Za-z0-9]+)")
+            // HubCloud (primary, proven): hubcloud.<any-tld>/drive/<code>.
+            // The gate moved from hubcloud.pw to hubcloud.mov — a .pw-only
+            // regex finds nothing and the plugin reports "No streams found".
+            val hubCode = Regex("hubcloud\\.[a-z]+/drive/([A-Za-z0-9]+)")
                 .find(gateHtml)?.groupValues?.getOrNull(1)
             val servers = if (!hubCode.isNullOrEmpty()) resolveHubCloudServers(hubCode) else emptyList()
             // GDFlix (best effort via the built-in extractors).

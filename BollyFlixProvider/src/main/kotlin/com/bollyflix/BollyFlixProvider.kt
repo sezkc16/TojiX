@@ -23,7 +23,9 @@ import com.lagradost.cloudstream3.toNewSearchResponseList
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.loadExtractor
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.jsoup.Jsoup
 
 class BollyFlixProvider : MainAPI() {
@@ -439,6 +441,72 @@ class BollyFlixProvider : MainAPI() {
         return out
     }
 
+    // Unpack a Dean-Edwards-style packed script (MixDrop variant: the
+    // encoder is the identity, so tokens are plain decimal numbers).
+    // eval(function(p,a,c,k,e,d){...}('PAYLOAD',10,33,'K'.split('|'),0,{}))
+    private fun unpackMixdropJs(html: String): String? {
+        val m = Regex(
+            """\}\('((?:[^'\\]|\\.)*)',\s*\d+,\s*(\d+),\s*'((?:[^'\\]|\\.)*)'\.split""",
+            RegexOption.DOT_MATCHES_ALL
+        ).find(html) ?: return null
+        var payload = m.groupValues[1].replace("\\\"", "\"")
+        val count = m.groupValues[2].toIntOrNull() ?: return null
+        val keys = m.groupValues[3].split("|")
+        for (i in (count - 1) downTo 0) {
+            val word = keys.getOrNull(i) ?: continue
+            if (word.isEmpty()) continue
+            payload = payload.replace(Regex("\\b$i\\b")) { word }
+        }
+        return payload
+    }
+
+    // MixDrop in-plugin resolver. The built-in MixDrop extractor lists
+    // the sources but the video URL 403s on playback (it is served
+    // without the /f/ page as referer). Fetch /f/ -> /e/ embed, unpack
+    // the packed JS to get MDCore.wurl + MDCore.referrer, and emit the
+    // wurl as a direct VIDEO link with the /f/ page as referer.
+    private suspend fun resolveMixDrop(
+        fUrl: String,
+        label: String,
+        quality: Int,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        return try {
+            val fHtml = try {
+                app.get(fUrl, headers = browserHeaders).text
+            } catch (e: Exception) { return false }
+            val embedUrl = Regex("""https?://[^"'\s]+/e/[A-Za-z0-9]+""")
+                .find(fHtml)?.value
+                ?: fUrl.replace("/f/", "/e/")
+            val embedHtml = try {
+                app.get(embedUrl, headers = browserHeaders + ("Referer" to fUrl)).text
+            } catch (e: Exception) { return false }
+            val unpacked = unpackMixdropJs(embedHtml) ?: return false
+            val wurl = Regex("""MDCore\.wurl\s*=\s*"([^"]+)"""")
+                .find(unpacked)?.groupValues?.getOrNull(1)?.trim().orEmpty()
+            if (wurl.isEmpty()) return false
+            val videoUrl = if (wurl.startsWith("//")) "https:$wurl" else wurl
+            val refRaw = Regex("""MDCore\.referrer\s*=\s*"([^"]+)"""")
+                .find(unpacked)?.groupValues?.getOrNull(1)
+            val referrer = try {
+                if (refRaw.isNullOrEmpty()) fUrl
+                else java.net.URLDecoder.decode(refRaw, "UTF-8")
+            } catch (e: Exception) { fUrl }
+            callback(
+                newExtractorLink(
+                    source = "BollyFlix",
+                    name = "BollyFlix MixDrop $label",
+                    url = videoUrl,
+                    type = ExtractorLinkType.VIDEO
+                ) {
+                    this.quality = quality
+                    this.referer = referrer
+                }
+            )
+            true
+        } catch (e: Exception) { false }
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -458,7 +526,13 @@ class BollyFlixProvider : MainAPI() {
                 }
                 "linksmod" -> {
                     for (mirror in fetchLinksmodMirrors(entry.id)) {
-                        if (loadExtractor(mirror, subtitleCallback, callback)) found = true
+                        // MixDrop: resolve in-plugin so the video URL
+                        // carries the /f/ page as referer; fall back to
+                        // the built-in extractor if that fails.
+                        if (mirror.contains("mixdrop.ag") || mirror.contains("mxdrop.click")) {
+                            if (resolveMixDrop(mirror, entry.label, entry.quality, callback)) found = true
+                            else if (loadExtractor(mirror, subtitleCallback, callback)) found = true
+                        } else if (loadExtractor(mirror, subtitleCallback, callback)) found = true
                     }
                 }
             }

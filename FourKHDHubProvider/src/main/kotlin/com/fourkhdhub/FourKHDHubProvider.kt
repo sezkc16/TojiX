@@ -433,7 +433,10 @@ class FourKHDHubProvider : MainAPI() {
             val u = url.trim()
             if (u.isNotEmpty() && seen.add(server to u)) out.add(HubServer(server, u))
         }
-        val btnRe = Regex("<a\\s+href=\"([^\"]+)\"[^>]*>\\s*(?:<i[^>]*></i>\\s*)?Download \\[([^\\]]+)\\]")
+        // Lenient on purpose: gamerxyt's buttons carry an <i> icon (and
+        // sometimes extra attrs/whitespace) between <a> and "Download".
+        // A strict regex matches 0 buttons and only the fallback row shows.
+        val btnRe = Regex("<a[^>]*?href=\"([^\"]+)\"[^>]*>\\s*(?:<[^>]+>\\s*){0,3}Download\\s*\\[([^\\]]+)\\]")
         for (m in btnRe.findAll(gamerHtml)) {
             val href = m.groupValues[1].trim()
             val label = m.groupValues[2].trim()

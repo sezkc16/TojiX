@@ -80,8 +80,8 @@ class KatMovieHDProvider : MainAPI() {
 
     // ---- JS object-literal -> JSON helpers (same as KatDrama) ----
 
-    private fun extractBalanced(text: String, startMarker: String, open: Char, close: Char): String? {
-        val start = text.indexOf(startMarker)
+    private fun extractBalanced(text: String, startMarker: String, open: Char, close: Char, startFrom: Int = 0): String? {
+        val start = text.indexOf(startMarker, startFrom)
         if (start < 0) return null
         var idx = start + startMarker.length
         // skip whitespace
@@ -158,10 +158,26 @@ class KatMovieHDProvider : MainAPI() {
         // The list payload lives in: __sveltekit_*.resolve({id:1,data:{success:true,data:{items:[...],page:1,...}}})
         // The object right after "data:{success:true,data:" IS the list data:
         // {items:[...],page:1,perPage:12,totalItems:...,totalPages:...}
+        // BUT the page carries TWO resolve payloads: on SEARCH pages the
+        // FIRST one is the categories array ([{name:"Action",...}]), NOT
+        // the items object — the old indexOf-based parse hit that array,
+        // extractBalanced expected '{' but found '[', and search() returned
+        // null ("returned nothing") for EVERY query. Scan every occurrence
+        // of the marker and take the first one that parses as a ListData
+        // with items. (Home/category pages are unaffected: their first
+        // payload already is the items object.)
         val marker = "data:{success:true,data:"
-        if (!html.contains(marker)) return null
-        val obj = extractBalanced(html, marker, '{', '}') ?: return null
-        return tryParseJson<ListData>(quoteJsKeys(obj))
+        var from = 0
+        while (true) {
+            val at = html.indexOf(marker, from)
+            if (at < 0) return null
+            val obj = extractBalanced(html, marker, '{', '}', at)
+            if (obj != null) {
+                val parsed = tryParseJson<ListData>(quoteJsKeys(obj))
+                if (parsed?.items != null) return parsed
+            }
+            from = at + marker.length
+        }
     }
 
     private fun parsePostContent(html: String): String? {
@@ -222,6 +238,24 @@ class KatMovieHDProvider : MainAPI() {
             l.contains("480", true) -> Qualities.P480.value
             else -> Qualities.Unknown.value
         }
+    }
+
+    // Plot: movie pages have <h3>... Plot:</h3><p>synopsis</p>, series
+    // pages have <h2>... - Storyline:</h2><p>synopsis</p> (both verified
+    // live: Hai Jawani Toh Ishq Hona Hai 2026 movie, MobLand S2 series).
+    // The heading's next <p> sibling is the synopsis; the "DESCRIPTION:"
+    // paragraph is SEO junk and is never used. Applied to the post-content
+    // doc (cdoc), not the page doc.
+    private fun parsePlot(cdoc: org.jsoup.nodes.Document): String? {
+        for (h in cdoc.select("h2, h3")) {
+            val t = h.text()
+            if (!t.contains("Plot:", true) && !t.contains("Storyline:", true)) continue
+            val sib = h.nextElementSibling() ?: continue
+            if (sib.tagName() != "p") continue
+            val text = sib.text().replace(Regex("\\s+"), " ").trim()
+            if (text.length >= 40 && !text.startsWith("N/A")) return text
+        }
+        return null
     }
 
     // ---- Main page / search ----
@@ -344,6 +378,7 @@ class KatMovieHDProvider : MainAPI() {
 
         val content = contentForPoster ?: return null
         val cdoc = Jsoup.parse(content)
+        val plot = parsePlot(cdoc)
 
         val seasonFromTitle = Regex("(?i)Season\\s+(\\d+)").find(title)?.groupValues?.getOrNull(1)?.toIntOrNull()
         val isSeriesTitle = title.contains("Season", true) || url.contains("season", true)
@@ -543,6 +578,7 @@ class KatMovieHDProvider : MainAPI() {
                 val data = MovieData(playId, movieLinks)
                 return newMovieLoadResponse(title, url, TvType.Movie, toJsonString(data)) {
                     this.posterUrl = poster
+                    this.plot = plot
                 }
             }
         }
@@ -561,11 +597,13 @@ class KatMovieHDProvider : MainAPI() {
                 )
                 newTvSeriesLoadResponse(title, url, TvType.TvSeries, eps) {
                     this.posterUrl = poster
+                    this.plot = plot
                 }
             } else {
                 val data = MovieData(playId, emptyList())
                 newMovieLoadResponse(title, url, TvType.Movie, toJsonString(data)) {
                     this.posterUrl = poster
+                    this.plot = plot
                 }
             }
         }
@@ -573,6 +611,7 @@ class KatMovieHDProvider : MainAPI() {
         if (episodes.isEmpty()) return null
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
             this.posterUrl = poster
+            this.plot = plot
         }
     }
 
@@ -656,8 +695,8 @@ class KatMovieHDProvider : MainAPI() {
     }
 
     // Resolve the 10Gbps pixel link to the direct Google video file.
-    // Chain: pixel.hubcloud.pw/?id=<token> -> 302 workers.dev
-    // -> 302 cryptonewz.online/dl.php?link=<googleusercontent URL>.
+    // Chain: pixel.hubcloud.mov (or gpdl.hubcloud.mov)/?id=<token>
+    // -> 302 workers.dev -> 302 cryptonewz.online/dl.php?link=<googleusercontent URL>.
     // The workers.dev hop is flaky (HTTP 500) — any failure just skips
     // 10G for this file, it never breaks the other servers.
     private suspend fun resolvePixel10G(pixelUrl: String): String? {

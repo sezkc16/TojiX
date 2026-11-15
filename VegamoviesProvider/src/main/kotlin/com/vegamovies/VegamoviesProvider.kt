@@ -11,6 +11,7 @@ import com.lagradost.cloudstream3.SearchResponseList
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.mainPageOf
 import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
@@ -80,6 +81,25 @@ class VegamoviesProvider : MainAPI() {
 
     private fun cleanTitle(raw: String): String {
         return raw.replace(Regex("\\s+"), " ").trim()
+    }
+
+    // Synopsis: the detail page has an <h3>Movie-SYNOPSIS/PLOT:</h3>
+    // followed by one <p> with the plot ("When a dangerous syndicate
+    // expands its reach to threaten his family's peace, retired
+    // jailer Tiger Muthuvel Pandian goes undercover as a driver. ...").
+    // Same heading on movie and series pages (verified live 2026-11-15:
+    // Jailer 2 movie + Bigg Boss S20).
+    private fun parsePlot(doc: org.jsoup.nodes.Document): String? {
+        for (h in doc.select("h2, h3, h4")) {
+            val t = h.text()
+            if (t.contains("storyline", true) || t.contains("synopsis", true)) {
+                var sib = h.nextElementSibling()
+                while (sib != null && sib.tagName() != "p") sib = sib.nextElementSibling()
+                val plot = sib?.text()?.trim().takeIf { !it.isNullOrEmpty() }
+                if (plot != null) return plot
+            }
+        }
+        return null
     }
 
     private fun fixPoster(poster: String?): String? {
@@ -190,6 +210,7 @@ class VegamoviesProvider : MainAPI() {
         if (title.isEmpty()) return null
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
             ?: fixPoster(doc.selectFirst(".blog-pic img, article img")?.attr("src"))
+        val plot = parsePlot(doc)
         val sections = parseQualitySections(html)
         if (sections.isEmpty()) return null // vgmlinks-only posts can't play
         val isSeries = title.contains("Season", true)
@@ -238,6 +259,7 @@ class VegamoviesProvider : MainAPI() {
             episodes.sortWith(compareBy({ it.episode ?: 0 }, { it.name }))
             return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
                 this.posterUrl = poster
+                this.plot = plot
             }
         } else {
             val links = sections.map { sec ->
@@ -247,6 +269,7 @@ class VegamoviesProvider : MainAPI() {
             val dataJson = toJson(EpisodeData(links = links)) ?: return null
             return newMovieLoadResponse(title, url, TvType.Movie, dataJson) {
                 this.posterUrl = poster
+                this.plot = plot
             }
         }
     }
@@ -330,12 +353,34 @@ class VegamoviesProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val ep = tryParseJson<EpisodeData>(data) ?: return false
-        var found = false
-        ep.links?.forEach { entry ->
+        val entries = ep.links ?: return false
+        // NOTE on FSL/FSLv2 (user report 2026-11-15: "only GDrive
+        // Instant opens, no FSL/FSLv2"): there is NO HubCloud link
+        // anywhere in this site's chain, so no FSL row can be built.
+        // Detail pages link only nexdrive pages; a nexdrive page links
+        // only fast-dl.one (G-Direct [Instant], resolved below) and
+        // vgmlinks.live — and vgmlinks serves an EMPTY link grid behind
+        // a Cloudflare Turnstile human check ("Please verify that you
+        // are human", POST form, zero server URLs in the HTML), which a
+        // plain OkHttp provider cannot solve (same class as CineFreak).
+        // G-Direct is therefore the only obtainable source here.
+        // What IS fixed here: the old loop resolved the qualities
+        // SERIALLY (nexdrive + fast-dl + prepare per quality, ~15 HTTP
+        // hops for 5 qualities), so the later rows regularly arrived
+        // after the app's loadLinks timeout and only the first
+        // "G-Direct" row ever showed. Resolve all qualities
+        // CONCURRENTLY (amap, CloudStream's own concurrent map — same
+        // pattern as Movies4u v4 / SSRMovies v7) and emit in page order.
+        val resolved: List<Pair<LinkEntry, String?>> = entries.amap { entry ->
             val direct = when (entry.host) {
                 "nexdrive" -> resolveNexdrive(entry.id, entry.ep)
                 else -> null
-            } ?: return@forEach
+            }
+            entry to direct
+        }
+        var found = false
+        for ((entry, direct) in resolved) {
+            if (direct == null) continue
             callback(
                 newExtractorLink(
                     source = "G-Direct",

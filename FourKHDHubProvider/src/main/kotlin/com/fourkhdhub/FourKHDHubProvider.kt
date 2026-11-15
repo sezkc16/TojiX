@@ -162,9 +162,11 @@ class FourKHDHubProvider : MainAPI() {
         if (title.isEmpty()) return null
         val year = Regex("\\((\\d{4})\\)").find(rawH1)?.groupValues?.getOrNull(1)?.toIntOrNull()
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-        // Plot: the single long <p> (synopsis).
-        val plot = doc.select("p").map { cleanTitle(it.text()) }
-            .firstOrNull { it.length >= 100 }
+        // Plot: the synopsis is the <p class="mt-4"> right under the
+        // Watch Online / Trailer buttons (verified live on movie AND
+        // series pages). The old "first long <p>" picked up the NAV MENU
+        // text ("Latest Movies Hindi Movies English Movies ...").
+        val plot = doc.selectFirst("p.mt-4")?.let { cleanTitle(it.text()) }?.takeIf { it.isNotEmpty() }
         val tags = doc.select("span.badge").map { cleanTitle(it.text()) }
             .filter { it.isNotEmpty() }.distinct().take(8)
         val isSeries = url.contains("-series-")
@@ -379,8 +381,8 @@ class FourKHDHubProvider : MainAPI() {
     }
 
     // Resolve the 10Gbps pixel link to the direct Google video file.
-    // Chain: pixel.hubcloud.pw/?id=<token> -> 302 workers.dev
-    // -> 302 cryptonewz.online/dl.php?link=<googleusercontent URL>.
+    // Chain: pixel.hubcloud.mov (or gpdl.hubcloud.mov)/?id=<token>
+    // -> 302 workers.dev -> 302 cryptonewz.online/dl.php?link=<googleusercontent URL>.
     // The workers.dev hop is flaky (HTTP 500) — any failure just skips
     // 10G for this file, it never breaks the other servers.
     private suspend fun resolvePixel10G(pixelUrl: String): String? {
@@ -474,23 +476,33 @@ class FourKHDHubProvider : MainAPI() {
         return out
     }
 
-    // hubdrive.blog/file/<id> -> HubDrive page with a hubcloud.pw/drive/<code>
+    // hubdrive.blog/file/<id> -> HubDrive page with a hubcloud.<tld>/drive/<code>
     // link, resolved by the same HubCloud chain as KatDrama/HDHub4u.
+    // HubCloud moved hubcloud.pw -> hubcloud.mov (verified live 2026-11-15:
+    // hubdrive.blog pages now link hubcloud.mov/drive/<code>). Accept any
+    // hubcloud TLD so the next move does not break resolution again.
     private suspend fun resolveHubDrive(fileId: String): List<HubServer> {
         val html = try {
             app.get("https://hubdrive.blog/file/$fileId", headers = browserHeaders).text
         } catch (e: Exception) { return emptyList() }
-        val code = Regex("hubcloud\\.pw/drive/([A-Za-z0-9]+)").find(html)?.groupValues?.getOrNull(1) ?: return emptyList()
+        val code = Regex("hubcloud\\.[a-z]+/drive/([A-Za-z0-9]+)").find(html)?.groupValues?.getOrNull(1) ?: return emptyList()
         return resolveHubCloudServers(code)
     }
 
     // Resolve one greenmotors button to the direct video file(s) — one
     // entry per HubCloud server, so each server shows as its own source.
+    // The greenmotors target is a hubcloud.<tld>/drive/<code> (hubcloud.pw
+    // moved to hubcloud.mov — verified live 2026-11-15) or a
+    // hubdrive.blog/file/<id>. Accept any hubcloud TLD (HDHub4u v10
+    // pattern) so the next move does not break resolution again; the old
+    // .pw-only match fell through to the generic http branch and emitted
+    // the hubcloud drive PAGE url itself as a "video" source, so nothing
+    // played.
     private suspend fun resolveGmEntry(gmUrl: String): List<HubServer> {
         val target = resolveGreenMotors(gmUrl) ?: return emptyList()
         return when {
-            target.contains("hubcloud.pw/drive/") -> {
-                val code = target.substringAfter("hubcloud.pw/drive/").substringBefore("/").substringBefore("?").trim()
+            Regex("hubcloud\\.[a-z]+/drive/").containsMatchIn(target) -> {
+                val code = Regex("hubcloud\\.[a-z]+/drive/([A-Za-z0-9]+)").find(target)?.groupValues?.getOrNull(1).orEmpty()
                 if (code.isEmpty()) emptyList() else resolveHubCloudServers(code)
             }
             target.contains("hubdrive.blog/file/") -> {

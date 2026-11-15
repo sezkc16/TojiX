@@ -1,5 +1,5 @@
 // Use an integer for version numbers
-version = 3
+version = 4
 
 cloudstream {
     description = "Hindi Dubbed Anime Series & Anime Movies from GokuHD"

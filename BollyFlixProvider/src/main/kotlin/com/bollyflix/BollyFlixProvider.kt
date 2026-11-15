@@ -78,6 +78,24 @@ class BollyFlixProvider : MainAPI() {
         return raw.replace(Regex("\\s+"), " ").trim()
     }
 
+    // Synopsis: the detail page has an <h2>Storyline:</h2> followed by
+    // one <p> with the plot ("When a dangerous syndicate threatens
+    // his family, retired jailer Tiger Muthuvel Pandian goes
+    // undercover as a driver ..."). Same heading on movie and series
+    // pages (verified live 2026-11-15: Jailer 2 movie + VisionQuest S1).
+    private fun parsePlot(doc: org.jsoup.nodes.Document): String? {
+        for (h in doc.select("h2, h3, h4")) {
+            val t = h.text()
+            if (t.contains("storyline", true) || t.contains("synopsis", true)) {
+                var sib = h.nextElementSibling()
+                while (sib != null && sib.tagName() != "p") sib = sib.nextElementSibling()
+                val plot = sib?.text()?.trim().takeIf { !it.isNullOrEmpty() }
+                if (plot != null) return plot
+            }
+        }
+        return null
+    }
+
     // Display title: strip the "Download " prefix and the
     // " | BollyFlix" suffix, cut at the first quality token
     // (480p/720p/1080p/2160p), strip bracket groups, collapse
@@ -175,12 +193,13 @@ class BollyFlixProvider : MainAPI() {
         if (title.isEmpty()) return null
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
             ?: doc.select("img[src*=bflixcdn.xyz]").firstOrNull()?.attr("src")
+        val plot = parsePlot(doc)
         val isSeries = isSeriesUrlOrTitle(url, title)
 
         if (isSeries) {
-            return loadSeries(title, url, doc, poster)
+            return loadSeries(title, url, doc, poster, plot)
         } else {
-            return loadMovie(title, url, doc, poster)
+            return loadMovie(title, url, doc, poster, plot)
         }
     }
 
@@ -189,7 +208,7 @@ class BollyFlixProvider : MainAPI() {
     // with TWO <a class="dl"> buttons: dl.fastdlserver.site/?id=<b64>
     // &type=file ("Google Drive") and linksmod.top/view/<id>
     // ("Download Links"). One LinkEntry per (quality, host).
-    private suspend fun loadMovie(title: String, url: String, doc: org.jsoup.nodes.Document, poster: String?): LoadResponse? {
+    private suspend fun loadMovie(title: String, url: String, doc: org.jsoup.nodes.Document, poster: String?, plot: String?): LoadResponse? {
         val links = mutableListOf<LinkEntry>()
         for (h5 in doc.select("h5")) {
             val heading = cleanText(h5.text())
@@ -221,6 +240,7 @@ class BollyFlixProvider : MainAPI() {
         val dataJson = toJson(EpisodeData(links = links)) ?: return null
         return newMovieLoadResponse(title, url, TvType.Movie, dataJson) {
             this.posterUrl = poster
+            this.plot = plot
         }
     }
 
@@ -241,7 +261,7 @@ class BollyFlixProvider : MainAPI() {
     //     SSRMovies). The season is parsed from the title ("Season 1").
     // One HTTP fetch per group (same pattern as HiCine's per-group fetch).
     // Series pages group downloads by QUALITY (h4 "… 480p [150MB/E]"), not by "Part N" — e.g. VisionQuest (2026-11-12).
-    private suspend fun loadSeries(title: String, url: String, doc: org.jsoup.nodes.Document, poster: String?): LoadResponse? {
+    private suspend fun loadSeries(title: String, url: String, doc: org.jsoup.nodes.Document, poster: String?, plot: String?): LoadResponse? {
         val episodes = mutableListOf<Episode>()
         val season = Regex("(?i)Season\\s*(\\d+)").find(title)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
         // Quality-group layout: episode number -> all quality variants.
@@ -306,6 +326,7 @@ class BollyFlixProvider : MainAPI() {
         episodes.sortWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
             this.posterUrl = poster
+            this.plot = plot
         }
     }
 

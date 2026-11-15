@@ -83,6 +83,25 @@ class Movies4uProvider : MainAPI() {
         return t
     }
 
+    // Synopsis: the detail page has a heading followed by one <p> with
+    // the plot — movies use <h4>: Movie synopsis/PLOT :</h4>, series
+    // pages use <h3>Storyline:</h3> ("A retired officer's peaceful
+    // life is disrupted when a dangerous criminal organization
+    // threatens his family. ..."). Verified live 2026-11-15 (Jailer 2
+    // movie + Family Full House series).
+    private fun parsePlot(doc: org.jsoup.nodes.Document): String? {
+        for (h in doc.select("h2, h3, h4")) {
+            val t = h.text()
+            if (t.contains("storyline", true) || t.contains("synopsis", true)) {
+                var sib = h.nextElementSibling()
+                while (sib != null && sib.tagName() != "p") sib = sib.nextElementSibling()
+                val plot = sib?.text()?.trim().takeIf { !it.isNullOrEmpty() }
+                if (plot != null) return plot
+            }
+        }
+        return null
+    }
+
     private fun isSeriesTitle(title: String): Boolean {
         return title.contains("Season", true)
             || title.contains("TV-Show", true)
@@ -159,6 +178,7 @@ class Movies4uProvider : MainAPI() {
         if (title.isEmpty()) return null
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
             ?: doc.selectFirst("div.entry-content img")?.attr("src")
+        val plot = parsePlot(doc)
         val isSeries = isSeriesTitle(rawTitle)
 
         val content = doc.selectFirst("div.entry-content") ?: doc.body() ?: return null
@@ -239,6 +259,7 @@ class Movies4uProvider : MainAPI() {
             episodes.sortWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
             return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
                 this.posterUrl = poster
+                this.plot = plot
             }
         } else {
             // Movie: each quality is an h5 heading (full filename + size)
@@ -270,6 +291,7 @@ class Movies4uProvider : MainAPI() {
             val dataJson = toJson(EpisodeData(links = links)) ?: return null
             return newMovieLoadResponse(title, url, TvType.Movie, dataJson) {
                 this.posterUrl = poster
+                this.plot = plot
             }
         }
     }

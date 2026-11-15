@@ -121,6 +121,18 @@ class GokuHDProvider : MainAPI() {
         return if (poster.startsWith("http")) poster else mainUrl + poster
     }
 
+    // Detail-page synopsis: og:description carries the real plot on both
+    // series and movie pages (verified live 2026-11-15: "In the ocean,
+    // Alvida and her pirate crew attack a cruise ship..." / "There once
+    // was a pirate known as the Great Gold Pirate Woonan..."). Meta
+    // description holds the same text as a fallback.
+    private fun parseDescription(doc: org.jsoup.nodes.Document): String? {
+        val og = doc.selectFirst("meta[property=og:description]")?.attr("content")?.trim()
+        val meta = doc.selectFirst("meta[name=description]")?.attr("content")?.trim()
+        val text = listOfNotNull(og, meta).firstOrNull { it.length >= 40 } ?: return null
+        return cleanTitle(text)
+    }
+
     private fun isSeriesTitle(title: String): Boolean {
         return title.contains("Season", true)
             || title.contains("TV Series", true)
@@ -286,7 +298,11 @@ class GokuHDProvider : MainAPI() {
     )
 
     private fun fastdlOf(s: String): String? =
-        Regex("""https://fastdl\.beer/embed\.php\?download=[A-Za-z0-9]+""").find(s)?.value
+        // fastdl moved embed.php -> embed (verified live 2026-11-15:
+        // nexdrive pages now link https://fastdl.beer/embed?download=<id>,
+        // the old embed.php regex matched nothing, so every episode's
+        // G-Direct link was lost and loadLinks returned no sources).
+        Regex("""https://fastdl\.beer/embed(?:\.php)?\?download=[A-Za-z0-9]+""").find(s)?.value
 
     private fun filepressOf(s: String): String? =
         Regex("""https://(?:filebee\.xyz|filebee\.top)/file/[A-Za-z0-9]+""").find(s)?.value
@@ -375,6 +391,7 @@ class GokuHDProvider : MainAPI() {
         if (title.isEmpty()) return null
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
             ?: fixPoster(doc.selectFirst("article img")?.attr("src"))
+        val description = parseDescription(doc)
         val sections = parseDetailSections(doc)
         if (sections.isEmpty()) return null
         val isSeries = sections.any { it.season != null } || isSeriesTitle(title)
@@ -466,6 +483,7 @@ class GokuHDProvider : MainAPI() {
             episodes.sortWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
             return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                 this.posterUrl = poster
+                this.plot = description
             }
         } else {
             // Movie: one LinkEntry per (quality, host) — the nexdrive page
@@ -497,6 +515,7 @@ class GokuHDProvider : MainAPI() {
             val dataJson = toJson(EpisodeData(links)) ?: return null
             return newMovieLoadResponse(title, url, TvType.AnimeMovie, dataJson) {
                 this.posterUrl = poster
+                this.plot = description
             }
         }
     }

@@ -63,6 +63,24 @@ class CineVoodProvider : MainAPI() {
         @JsonProperty("links") val links: List<LinkEntry>? = null,
     )
 
+    // search.php JSON models (the site's own search UI: search.html +
+    // search.js fetches search.php?q=<q>&page=<p> and renders
+    // {found, hits:[{document:{post_title, permalink, post_thumbnail}}]}).
+    data class CvSearchDoc(
+        @JsonProperty("post_title") val postTitle: String? = null,
+        @JsonProperty("permalink") val permalink: String? = null,
+        @JsonProperty("post_thumbnail") val postThumbnail: String? = null,
+    )
+
+    data class CvSearchHit(
+        @JsonProperty("document") val document: CvSearchDoc? = null,
+    )
+
+    data class CvSearchResult(
+        @JsonProperty("found") val found: Int? = null,
+        @JsonProperty("hits") val hits: List<CvSearchHit>? = null,
+    )
+
     private fun qualityValue(label: String): Int {
         return when {
             label.contains("2160") || label.contains("4K", true) -> Qualities.P2160.value
@@ -150,10 +168,50 @@ class CineVoodProvider : MainAPI() {
     )
 
     override suspend fun search(query: String, page: Int): SearchResponseList? {
-        // WordPress search
-        val url = "$mainUrl/?s=${query.trim().replace(" ", "+")}"
-        val html = app.get(url, headers = browserHeaders).text
-        return parseListing(html).toNewSearchResponseList()
+        // WP search is dead: /?s=<q> 302-redirects to the homepage, so the
+        // old search returned the 29 latest posts for every query
+        // (verified live 2026-11-15: /?s=Jailer -> 302 Location: /).
+        // The site's real search is search.php (see search.js: proxyUrl
+        // 'search.php', fetch '?q=<q>&page=<p>' -> JSON {found, hits}).
+        // Cloudflare 403s search.php WITHOUT a Referer, so the search.html
+        // Referer the browser would send is required (verified live:
+        // no Referer -> 403 "Just a moment...", Referer search.html -> 200,
+        // "Jailer" found 5, "Beast" found 25).
+        val q = java.net.URLEncoder.encode(query.trim(), "UTF-8")
+        val url = "$mainUrl/search.php?q=$q&page=$page"
+        val res = try {
+            app.get(
+                url,
+                headers = browserHeaders + mapOf("Referer" to "$mainUrl/search.html")
+            ).parsed<CvSearchResult>()
+        } catch (e: Exception) {
+            return null
+        }
+        val hits = res.hits ?: return emptyList<com.lagradost.cloudstream3.SearchResponse>().toNewSearchResponseList()
+        val out = mutableListOf<com.lagradost.cloudstream3.SearchResponse>()
+        val seen = mutableSetOf<String>()
+        for (hit in hits) {
+            val doc = hit.document ?: continue
+            val rawTitle = doc.postTitle?.trim() ?: continue
+            val link = doc.permalink?.trim() ?: continue
+            val url2 = if (link.startsWith("http")) link else mainUrl + link
+            // The API returns every hit TWICE (verified live: Jailer 2
+            // 1080p appears twice with the same permalink) — dedup.
+            if (!seen.add(url2)) continue
+            if (rawTitle.isEmpty()) continue
+            val display = rawTitle
+                .replace(Regex("\\s*CineVood\\s*$", RegexOption.IGNORE_CASE), "")
+                .replace(Regex("\\s+"), " ").trim()
+            val isSeries = url2.contains("/web-series/") || url2.contains("/tv-shows/")
+                || rawTitle.contains("Season", true)
+            val poster = doc.postThumbnail?.takeIf { it.isNotEmpty() }
+            if (isSeries) {
+                out.add(newTvSeriesSearchResponse(display, url2, TvType.TvSeries) { this.posterUrl = poster })
+            } else {
+                out.add(newMovieSearchResponse(display, url2, TvType.Movie) { this.posterUrl = poster })
+            }
+        }
+        return out.toNewSearchResponseList()
     }
 
     override suspend fun load(url: String): LoadResponse? {
@@ -168,6 +226,18 @@ class CineVoodProvider : MainAPI() {
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
             ?.takeIf { it.isNotEmpty() }
             ?: doc.selectFirst("article img, .post img, img[src*=tmdb]")?.attr("src")
+
+        // Detail-page synopsis (BEST EFFORT, NOT verifiable from this VM:
+        // detail pages are Cloudflare-403 here, home/search verify 200).
+        // og:description is the generic RankMath synopsis slot — the same
+        // slot carries a real plot on the sibling Vega-network sites
+        // (GokuHD verified live 2026-11-15). Dropped when it is just the
+        // title. Phone test must confirm a description actually shows.
+        val description = listOfNotNull(
+            doc.selectFirst("meta[property=og:description]")?.attr("content")?.trim(),
+            doc.selectFirst("meta[name=description]")?.attr("content")?.trim(),
+        ).firstOrNull { it.length >= 40 && it != title }
+            ?.let { cleanTitle(it) }
 
         // Downloads: each quality is an <h6> heading with the filename
         // and size (e.g. "...1080p X264 ... – 6.7 GB"), followed by a row
@@ -194,12 +264,20 @@ class CineVoodProvider : MainAPI() {
                 for (a in anchors) {
                     val href = a.attr("href").trim()
                     if (href.isEmpty()) continue
+                    // HubCloud moved hubcloud.pw -> hubcloud.mov (verified
+                    // live 2026-11-15 on the sibling HDHub4u fix; the
+                    // hubcloud.ist drive pages now link hubcloud.mov).
+                    // Accept any hubcloud TLD so the next move does not
+                    // break link collection again. Detail pages are
+                    // Cloudflare-403 from this VM, so the TLD CineVood
+                    // itself uses today is unverified — this accepts all.
+                    val hubId = Regex("hubcloud\\.[a-z]+/drive/([A-Za-z0-9]+)").find(href)
+                        ?.groupValues?.getOrNull(1)?.trim()
                     when {
-                        href.contains("hubcloud.pw/drive/") -> {
-                            val id = href.substringAfter("hubcloud.pw/drive/").substringBefore("/").substringBefore("?").trim()
-                            if (id.isNotEmpty() && seenIds.add("hub:$id")) {
+                        hubId != null -> {
+                            if (hubId.isNotEmpty() && seenIds.add("hub:$hubId")) {
                                 val label = if (isWatch) "Watch Online HubCloud" else "$qLabel$sizePart HubCloud"
-                                links.add(LinkEntry(label, "hubcloud", id, q))
+                                links.add(LinkEntry(label, "hubcloud", hubId, q))
                             }
                         }
                         href.contains("filepress") && href.contains("/file/") -> {
@@ -228,6 +306,7 @@ class CineVoodProvider : MainAPI() {
         val dataJson = toJson(EpisodeData(links = links)) ?: return null
         return newMovieLoadResponse(title, url, TvType.Movie, dataJson) {
             this.posterUrl = poster
+            this.plot = description
         }
     }
 

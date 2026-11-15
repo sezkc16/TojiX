@@ -142,10 +142,23 @@ class KatDramaProvider : MainAPI() {
         // The list payload lives in: __sveltekit_*.resolve({id:1,data:{success:true,data:{items:[...],page:1,...}}})
         // The object right after "data:{success:true,data:" IS the list data:
         // {items:[...],page:1,perPage:12,totalItems:...,totalPages:...}
+        // BUT the marker occurs MULTIPLE times per page, and on search
+        // pages the FIRST occurrence is the categories array
+        // (data:[{id:"complete-season",...}]) — extractBalanced expects
+        // '{', finds '[', returns null, and search returned nothing
+        // (verified live 2026-11-15: ?q=True Beauty, categories marker at
+        // offset 9872, items payload at 15854). Scan every occurrence and
+        // take the first one that parses to a ListData.
         val marker = "data:{success:true,data:"
-        if (!html.contains(marker)) return null
-        val obj = extractBalanced(html, marker, '{', '}') ?: return null
-        return tryParseJson<ListData>(quoteJsKeys(obj))
+        var from = 0
+        while (true) {
+            val idx = html.indexOf(marker, from)
+            if (idx < 0) return null
+            from = idx + marker.length
+            val obj = extractBalanced(html.substring(idx), marker, '{', '}') ?: continue
+            val parsed = tryParseJson<ListData>(quoteJsKeys(obj)) ?: continue
+            return parsed
+        }
     }
 
     private fun parsePostContent(html: String): String? {
@@ -278,6 +291,25 @@ class KatDramaProvider : MainAPI() {
 
         val content = contentForPoster ?: return null
         val cdoc = Jsoup.parse(content)
+
+        // Detail-page synopsis: the post body has a "Storyline:" section,
+        // <h2>Title (Season 1) (2020–2021) - Storyline:</h2> followed by
+        // a <p> with the real plot (verified live 2026-11-15 on True
+        // Beauty: "After being bullied and discriminated because of her
+        // ugly looks, a high school girl transforms herself into a
+        // gorgeous \"goddess\"..."). og:description is only the title here,
+        // so it is NOT used.
+        var description: String? = null
+        for (h2 in cdoc.select("h2")) {
+            if (!h2.text().contains("Storyline", ignoreCase = true)) continue
+            var sib = h2.nextElementSibling()
+            while (sib != null && sib.tagName() != "p") sib = sib.nextElementSibling()
+            val text = sib?.text()?.replace(Regex("\\s+"), " ")?.trim()
+            if (!text.isNullOrEmpty() && text.length >= 40) {
+                description = text
+                break
+            }
+        }
 
         // Episodes are grouped as: <p>Episode NN</p> then an <h3> with 3 links
         // (1080p HEVC / 720p HEVC / 480p) -> links.kmhd.me/file/<id>
@@ -429,6 +461,7 @@ class KatDramaProvider : MainAPI() {
 
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
             this.posterUrl = poster
+            this.plot = description
         }
     }
 

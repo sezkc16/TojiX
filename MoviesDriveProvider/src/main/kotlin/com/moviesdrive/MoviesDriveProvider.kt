@@ -80,6 +80,21 @@ class MoviesDriveProvider : MainAPI() {
         return raw.replace(Regex("\\s+"), " ").trim()
     }
 
+    // Plot: the "Storyline" section. Movie pages:
+    //   <h3>♦ Storyline :-</h3><p><strong>Title (2026)</strong> synopsis...</p>
+    // Series pages:
+    //   <h3>♦ Storyline-</h3><h5>synopsis...</h5>
+    // The heading's next sibling holds the text in both layouts; the
+    // movie <p> starts with a "<Title> (YYYY)" prefix, stripped here.
+    // (Verified live on Jailer 2 movie + Dead-End Job S1 series pages.)
+    private fun parsePlot(doc: org.jsoup.nodes.Document): String? {
+        val h = doc.select("h3:contains(Storyline)").firstOrNull() ?: return null
+        val sib = h.nextElementSibling() ?: return null
+        var text = cleanText(sib.text())
+        text = text.replace(Regex("^[^(]{0,60}\\(\\d{4}\\)\\s*"), "").trim()
+        return text.takeIf { it.length >= 40 }
+    }
+
     // Display title: cut at the first quality token (480p/720p/1080p/
     // 2160p), strip bracket groups, collapse whitespace.
     // "Jailer 2 (2026) HQ-HDRip [Hindi ...] 480p | 720p | ..." ->
@@ -195,6 +210,7 @@ class MoviesDriveProvider : MainAPI() {
             val dataJson = toJson(EpisodeData(links = links)) ?: return null
             return newMovieLoadResponse(title, url, TvType.Movie, dataJson) {
                 this.posterUrl = poster
+                this.plot = parsePlot(doc)
             }
         }
     }
@@ -257,13 +273,14 @@ class MoviesDriveProvider : MainAPI() {
         if (episodes.isEmpty()) return null
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
             this.posterUrl = poster
+            this.plot = parsePlot(doc)
         }
     }
 
     // Fetch one "Single Episode" mdrive.lol archive page and merge its
     // per-episode HubCloud/GDFlix buttons into byEpisode.
     // Page layout: <h5>EP01 – 480p [175.39 MB]</h5>
-    //   <h5><a href="https://hubcloud.pw/drive/<code>">HubCloud</a></h5>
+    //   <h5><a href="https://hubcloud.mov/drive/<code>">HubCloud</a></h5>
     //   <h5><a href="https://gdflix.vip/file/<id>">GDFliX</a></h5>
     private suspend fun fetchSingleEpisodePage(
         archiveUrl: String,
@@ -313,12 +330,17 @@ class MoviesDriveProvider : MainAPI() {
 
     // mdrive.lol/archive/<id> page: one HubCloud button + one GDFlix
     // button (image buttons; match by href domain, not by text).
+    // HubCloud moved hubcloud.pw -> hubcloud.mov (verified live 2026-11-15:
+    // archive pages now link hubcloud.mov/drive/<code>). Accept any
+    // hubcloud TLD so the next move does not break it again — the old
+    // (ist|pw) regex missed .mov, so movie pages lost their HubCloud
+    // source entirely and only the Cloudflare-guarded GDFlix link was left.
     private suspend fun fetchArchiveLinks(archiveUrl: String): List<LinkEntry> {
         val html = try {
             app.get(archiveUrl, headers = browserHeaders).text
         } catch (e: Exception) { return emptyList() }
         val out = mutableListOf<LinkEntry>()
-        Regex("hubcloud\\.(?:ist|pw)/drive/([A-Za-z0-9]+)")
+        Regex("hubcloud\\.[a-z]+/drive/([A-Za-z0-9]+)")
             .findAll(html).map { it.groupValues[1] }.distinct().forEach { code ->
                 out.add(LinkEntry("HubCloud", "hubcloud", code, Qualities.Unknown.value))
             }
@@ -357,8 +379,8 @@ class MoviesDriveProvider : MainAPI() {
     }
 
     // Resolve the 10Gbps pixel link to the direct Google video file.
-    // Chain: pixel.hubcloud.pw/?id=<token> -> 302 workers.dev
-    // -> 302 cryptonewz.online/dl.php?link=<googleusercontent URL>.
+    // Chain: pixel.hubcloud.mov (or gpdl.hubcloud.mov)/?id=<token>
+    // -> 302 workers.dev -> 302 cryptonewz.online/dl.php?link=<googleusercontent URL>.
     // The workers.dev hop is flaky (HTTP 500) — any failure just skips
     // 10G for this file, it never breaks the other servers.
     private suspend fun resolvePixel10G(pixelUrl: String): String? {

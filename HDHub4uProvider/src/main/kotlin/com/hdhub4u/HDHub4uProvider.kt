@@ -32,7 +32,7 @@ import org.jsoup.Jsoup
 
 class HDHub4uProvider : MainAPI() {
 
-    override var mainUrl = "https://new12.hdhub4u.cl"
+    override var mainUrl = "https://new14.hdhub4u.cl"
     override var name = "HDHub4u"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
     override var lang = "en"
@@ -140,8 +140,12 @@ class HDHub4uProvider : MainAPI() {
     )
 
     override suspend fun search(query: String, page: Int): SearchResponseList? {
-        // WordPress search
-        val url = "$mainUrl/?s=${query.trim().replace(" ", "+")}"
+        // WordPress search page: ?s= now 302-redirects to the home page
+        // (verified live 2026-11-15), but /search/<query> is
+        // server-rendered with the same -full-movie/-full-series cards.
+        // /search/<q>/page/2/ 404s, so search is page 1 only.
+        if (page > 1) return emptyList<com.lagradost.cloudstream3.SearchResponse>().toNewSearchResponseList()
+        val url = "$mainUrl/search/${query.trim().replace(" ", "+")}"
         val html = app.get(url, headers = browserHeaders).text
         return parseListing(html).toNewSearchResponseList()
     }

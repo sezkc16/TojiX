@@ -68,7 +68,7 @@ class KatMovieHDProvider : MainAPI() {
     // every quality variant stays visible with its full label + size).
     data class LinkEntry(
         @JsonProperty("label") val label: String? = null,
-        @JsonProperty("host") val host: String? = null,   // "kmhd" | "hubcloud" | "gdflix"
+        @JsonProperty("host") val host: String? = null,   // "kmhd" | "hubcloud" | "gdflix" | "bbupload" | "gofile"
         @JsonProperty("id") val id: String? = null,
     )
 
@@ -456,7 +456,12 @@ class KatMovieHDProvider : MainAPI() {
         // Each quality is an <h2> holding ONE <a>: the label (e.g.
         // "480p Links [337MB]") is the anchor text, the href is the link.
         // Hosts: links.kmhd.me/file/<id>, hubcloud.pw/drive/<code>,
-        // gdflix.vip/file/<id>. The ": DOWNLOAD LINKS :" anchor points to
+        // gdflix.vip/file/<id>. Some posts (e.g. Hai Jawani Toh Ishq
+        // Hona Hai 2026) have NO kmhd/hubcloud/gdflix links at all — only
+        // "WEBRip Direct Link" rows, one <h2> per quality holding TWO
+        // anchors: <a href="https://download.bbupload.to/download?v=<v>">
+        // 1080pDL</a> | <a href="https://gofile.io/d/<id>">GoFILE</a>.
+        // The ": DOWNLOAD LINKS :" anchor points to
         // kmhd.net/directlink (ad page) and is ignored, as are screenshots.
         val movieLinks = mutableListOf<LinkEntry>()
         for (el in cdoc.select("a")) {
@@ -477,6 +482,30 @@ class KatMovieHDProvider : MainAPI() {
                 href.contains("gdflix.vip/file/") -> {
                     val id = href.substringAfterLast("/").trim()
                     if (id.isNotEmpty() && label.isNotEmpty()) movieLinks.add(LinkEntry(label, "gdflix", id))
+                }
+                href.contains("bbupload.to/download") -> {
+                    // ?v=<code> — resolved in loadLinks via the host's own
+                    // ajax.php endpoint (see resolveBbUpload).
+                    val v = href.substringAfter("v=").substringBefore("&").trim()
+                    if (v.isNotEmpty() && label.isNotEmpty()) movieLinks.add(LinkEntry(label, "bbupload", v))
+                }
+                href.contains("gofile.io/d/") -> {
+                    val id = href.substringAfterLast("/").trim()
+                    if (id.isEmpty()) continue
+                    // The GoFILE anchor's own label has no quality
+                    // ("GoFILE") — the sibling bbupload anchor in the
+                    // same <h2> carries it ("1080pDL" / "720pDL" /
+                    // "480pDL"), so read the row text for the quality.
+                    val rowText = el.parent()?.text() ?: ""
+                    val q = when {
+                        rowText.contains("2160", true) || rowText.contains("4k", true) -> "2160p"
+                        rowText.contains("1080", true) -> "1080p"
+                        rowText.contains("720", true) -> "720p"
+                        rowText.contains("480", true) -> "480p"
+                        else -> ""
+                    }
+                    val entryLabel = if (q.isNotEmpty()) "$q GoFILE" else "GoFILE"
+                    movieLinks.add(LinkEntry(entryLabel, "gofile", id))
                 }
             }
         }
@@ -584,6 +613,27 @@ class KatMovieHDProvider : MainAPI() {
             if (it != "None") out["streamwish"] = "https://hglink.to/e/$it"
         }
         return out
+    }
+
+    // bbupload.to (ninjashare-style host): the download page's own JS
+    // calls GET /ajax.php?action=getdownload&data=<v> and gets
+    // {status:"ok",data:{downloadUrl:"https://superduperload.site/get/<b64>",
+    // FileName:"...mkv",filesize:"..."}}. The downloadUrl IS the direct
+    // file — verified live 2026-11-15: a ranged GET returns real
+    // Matroska bytes (EBML 1a 45 df a3) for all 3 qualities of Hai
+    // Jawani Toh Ishq Hona Hai 2026, no session cookie needed. The host
+    // mislabels Content-Type as image/png — the bytes are video, so the
+    // player must not trust the header.
+    private suspend fun resolveBbUpload(v: String): String? {
+        val json = try {
+            app.get(
+                "https://download.bbupload.to/ajax.php?action=getdownload&data=$v",
+                headers = browserHeaders
+            ).text
+        } catch (e: Exception) { return null }
+        val raw = Regex("downloadUrl\":\"([^\"]+)\"").find(json)?.groupValues?.getOrNull(1) ?: return null
+        val url = raw.replace("\\/", "/")
+        return url.takeIf { it.startsWith("https://") }
     }
 
     // One resolved HubCloud server: the actual server name (FSL, FSLv2,
@@ -825,6 +875,35 @@ class KatMovieHDProvider : MainAPI() {
                 }
                 "gdflix" -> {
                     if (loadExtractor("https://gdflix.vip/file/$id", subtitleCallback, callback)) {
+                        found = true
+                    }
+                }
+                "bbupload" -> {
+                    val direct = resolveBbUpload(id)
+                    if (!direct.isNullOrEmpty()) {
+                        callback(
+                            newExtractorLink(
+                                source = "BbUpload",
+                                name = "BbUpload $label",
+                                url = direct,
+                                type = ExtractorLinkType.VIDEO
+                            ) {
+                                this.quality = quality
+                                this.referer = "https://download.bbupload.to/"
+                            }
+                        )
+                        found = true
+                    }
+                }
+                "gofile" -> {
+                    // Built-in GoFile extractor (same pattern as
+                    // Movies4u/GokuHD "extractor" links). NOTE 2026-11-15:
+                    // this movie's folders (Rxgbc2/apBj6Q/7jhsF8) return
+                    // {"status":"error-notPremium"} from GoFile's own API
+                    // even with a valid guest token, so they will not play
+                    // here — bbupload carries the movie. Non-premium
+                    // folders still resolve through the extractor.
+                    if (loadExtractor("https://gofile.io/d/$id", subtitleCallback, callback)) {
                         found = true
                     }
                 }

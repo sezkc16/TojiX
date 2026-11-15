@@ -31,7 +31,7 @@ import org.jsoup.Jsoup
 
 class MoviesDriveProvider : MainAPI() {
 
-    override var mainUrl = "https://new2.moviesdrive.cyou"
+    override var mainUrl = "https://new3.moviesdrive.cyou"
     override var name = "MoviesDrive"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
     override var lang = "en"
@@ -154,9 +154,13 @@ class MoviesDriveProvider : MainAPI() {
     }
 
     override suspend fun search(query: String, page: Int): SearchResponseList? {
-        // WordPress search
+        // ?s= now 301-redirects to the JS search shell (/search.html?q=),
+        // which has no server-rendered results; /search/<query> is the
+        // server-rendered WordPress search page (same movies-grid cards).
+        // /search/<q>/page/2/ 404s, so search is page 1 only.
+        if (page > 1) return emptyList<com.lagradost.cloudstream3.SearchResponse>().toNewSearchResponseList()
         val q = query.trim().replace(" ", "+")
-        val url = if (page <= 1) "$mainUrl/?s=$q" else "$mainUrl/page/$page/?s=$q"
+        val url = "$mainUrl/search/$q"
         val html = app.get(url, headers = browserHeaders).text
         return parseListing(html).toNewSearchResponseList()
     }

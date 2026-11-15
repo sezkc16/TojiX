@@ -1,5 +1,5 @@
 // Use an integer for version numbers
-version = 6
+version = 7
 
 cloudstream {
     description = "Watch Anime Sub & Dub from Miruro"
@@ -15,7 +15,7 @@ cloudstream {
     status = 1
 
     tvTypes = listOf("Anime", "AnimeMovie")
-    iconUrl = "https://miruro.tv/icon-output.png"
+    iconUrl = "https://miruro.cx/icon-output.png"
 
     isCrossPlatform = true
 }

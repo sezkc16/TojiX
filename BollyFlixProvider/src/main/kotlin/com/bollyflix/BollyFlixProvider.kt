@@ -28,7 +28,7 @@ import org.jsoup.Jsoup
 
 class BollyFlixProvider : MainAPI() {
 
-    override var mainUrl = "https://bollyflix.church"
+    override var mainUrl = "https://new1.bollyflix.tours"
     override var name = "BollyFlix"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
     override var lang = "en"

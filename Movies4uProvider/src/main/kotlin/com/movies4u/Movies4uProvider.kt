@@ -31,7 +31,7 @@ import org.jsoup.Jsoup
 
 class Movies4uProvider : MainAPI() {
 
-    override var mainUrl = "https://movies4u.et"
+    override var mainUrl = "https://movies4u.gp"
     override var name = "Movies4u"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
     override var lang = "en"

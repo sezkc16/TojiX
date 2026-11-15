@@ -63,7 +63,7 @@ import org.jsoup.Jsoup
  */
 class MiruroProvider : MainAPI() {
 
-    override var mainUrl = "https://miruro.tv"
+    override var mainUrl = "https://miruro.cx"
     override var name = "Miruro"
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
     override var lang = "en"

@@ -9,6 +9,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import okhttp3.FormBody
 import org.json.JSONObject
 import org.jsoup.nodes.Element
 import java.util.Locale
@@ -71,17 +72,15 @@ class UHDMovies : ExtractorApi() {
  * are the same pages under a different host, so they are thin subclasses.
  *
  * A landing page lists the file name/size plus one button per server:
- * Cloud Download (direct file), Instant Download (video-seed unlock)
- * and Direct Links (Cloudflare-worker links). Each button becomes one
- * source row, tagged with its server so the row shows where the file
- * comes from.
+ * Cloud Download (direct file), Instant Download (video-seed unlock),
+ * Resume Worker Bot and Direct Links (Cloudflare-worker links). Each
+ * button becomes one source row, tagged with its server so the row
+ * shows where the file comes from.
  *
  * "Resume Cloud" is deliberately NOT emitted: its button resolves to
  * a .zip archive (Cloudflare Worker, application/x-zip) — a
  * download-only file the player cannot play, so the row failed
  * silently and Zeus auto-advanced past it (user report 2026-11-19).
- * "Resume Worker Bot" is likewise NOT emitted: the user wants
- * Instant-only rows (user report 2026-11-20).
  */
 open class Driveseed : ExtractorApi() {
     override val name = "Driveseed"
@@ -178,6 +177,18 @@ open class Driveseed : ExtractorApi() {
                     instant, "[Instant(Download)]"
                 )
             }
+            text.contains("Resume Worker Bot", ignoreCase = true) ||
+                text.contains("ResumeBot", ignoreCase = true) -> {
+                val resumeLink = try {
+                    resumeBot(href)
+                } catch (_: Exception) {
+                    null
+                } ?: return
+                emitLink(
+                    callback, fileName, fileSize, quality,
+                    resumeLink, "[ResumeBot]"
+                )
+            }
             text.contains("Direct Links", ignoreCase = true) -> {
                 val links = try {
                     cfType(fixUrlWithBase(href, baseUrl))
@@ -263,6 +274,38 @@ open class Driveseed : ExtractorApi() {
             }
         }
         return downloadLinks
+    }
+
+    /** "Resume Worker Bot": the page plants a token + download id in JS;
+     *  POST them back with the PHPSESSID cookie. */
+    private suspend fun resumeBot(url: String): String? {
+        return try {
+            val res = app.get(url)
+            val doc = res.document.toString()
+            val session = res.cookies["PHPSESSID"].orEmpty()
+            val token = Regex("formData\\.append\\('token', '([a-f0-9]+)'\\)")
+                .find(doc)?.groupValues?.getOrNull(1).orEmpty()
+            val id = Regex("fetch\\('/download\\?id=([a-zA-Z0-9/+]+)'\\)")
+                .find(doc)?.groupValues?.getOrNull(1).orEmpty()
+            if (token.isEmpty() || id.isEmpty()) return null
+            val origin = url.substringBefore("/download")
+            val body = FormBody.Builder().addEncoded("token", token).build()
+            val postRes = app.post(
+                "$origin/download?id=$id",
+                headers = mapOf(
+                    "Accept" to "*/*",
+                    "Origin" to origin,
+                    "Sec-Fetch-Site" to "same-origin"
+                ),
+                referer = url,
+                cookies = mapOf("PHPSESSID" to session),
+                requestBody = body
+            )
+            JSONObject(postRes.text).optString("url")
+                .takeIf { it.startsWith("http") }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /**

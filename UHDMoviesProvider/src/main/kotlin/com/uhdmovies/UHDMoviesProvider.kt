@@ -180,11 +180,12 @@ class UHDMoviesProvider : MainAPI() {
         val title = Regex("(^.*\\)\\d*)").find(titleRaw)
             ?.groupValues?.getOrNull(1) ?: titleRaw
         val href = element.select("div.entry-image > a").attr("href")
-            .takeIf { it.isNotBlank() }?.let { fixUrl(it) } ?: return null
+            .takeIf { it.isNotBlank() }?.let { fixUrlWithBase(it, mainUrl) }
+            ?: return null
         val img = element.selectFirst("div.entry-image > a > img")
         val posterRaw = img?.attr("data-src")?.takeIf { it.isNotBlank() }
             ?: img?.attr("src")?.takeIf { it.isNotBlank() }
-        val poster = posterRaw?.let { fixUrl(it) }
+        val poster = posterRaw?.let { fixUrlWithBase(it, mainUrl) }
         val quality = getSearchQuality(titleRaw)
         val classAttr = element.attr("class")
         val isSeries = Regex(
@@ -252,13 +253,11 @@ class UHDMoviesProvider : MainAPI() {
         val imdbRating = meta?.optString("imdbRating")
             ?.takeIf { it.isNotBlank() }
         val logo = meta?.optString("logo")?.takeIf { it.isNotBlank() }
-        val trailer = doc.select("p iframe").attr("src")
-            .takeIf { it.isNotBlank() }
 
         if (!isSeries) {
             return movieResponse(
                 doc, title, url, poster, collectionPoster, logo,
-                year, tags, trailer, ids, background, description, imdbRating
+                year, tags, background, description, imdbRating
             )
         }
 
@@ -332,13 +331,13 @@ class UHDMoviesProvider : MainAPI() {
         if (episodes.isEmpty()) {
             return movieResponse(
                 doc, title, url, poster, collectionPoster, logo,
-                year, tags, trailer, ids, background, description, imdbRating
+                year, tags, background, description, imdbRating
             )
         }
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
             applyMeta(
                 poster, collectionPoster, logo, year, tags,
-                trailer, ids, background, description, imdbRating
+                background, description, imdbRating
             )
         }
     }
@@ -352,8 +351,6 @@ class UHDMoviesProvider : MainAPI() {
         logo: String?,
         year: Int?,
         tags: List<String>,
-        trailer: String?,
-        ids: IdResult,
         background: String?,
         description: String?,
         imdbRating: String?
@@ -380,21 +377,23 @@ class UHDMoviesProvider : MainAPI() {
         return newMovieLoadResponse(title, url, TvType.Movie, data) {
             applyMeta(
                 poster, collectionPoster, logo, year, tags,
-                trailer, ids, background, description, imdbRating
+                background, description, imdbRating
             )
         }
     }
 
-    /** Shared details-page metadata (poster / year / tags / trailer /
-     *  tracker ids / backdrop / plot / score) for movies and series. */
+    /** Shared details-page metadata (poster / year / tags / backdrop /
+     *  plot / score) for movies and series. Note: this lib version does
+     *  not expose LoadResponse.addTrailer / addImdbId / addTMDbId (no
+     *  provider in this repo sets a trailer or tracker ids), so the
+     *  trailer and the TMDB/IMDb ids are fetched for enrichment only
+     *  and not attached to the response. */
     private suspend fun LoadResponse.applyMeta(
         poster: String?,
         collectionPoster: String?,
         logo: String?,
         year: Int?,
         tags: List<String>,
-        trailer: String?,
-        ids: IdResult,
         background: String?,
         description: String?,
         imdbRating: String?
@@ -407,9 +406,6 @@ class UHDMoviesProvider : MainAPI() {
         }
         this.year = year
         this.tags = tags
-        if (!trailer.isNullOrBlank()) LoadResponse.addTrailer(this, trailer)
-        if (ids.imdbId != null) LoadResponse.addImdbId(this, ids.imdbId)
-        ids.tmdbId?.let { LoadResponse.addTMDbId(this, it.toString()) }
         this.backgroundPosterUrl = background?.takeIf { it.isNotBlank() }
             ?: collectionPoster?.takeIf { it.isNotBlank() }
         this.plot = description

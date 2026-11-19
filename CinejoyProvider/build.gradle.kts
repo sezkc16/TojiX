@@ -53,13 +53,14 @@ tasks.named("compileDex") {
     dependsOn(extractDependencies)
 }
 
-// Gradle validates that bundleLibRuntimeToJarDebug declares a dependency
-// on any task whose output it consumes — extractDependencies writes
-// into kotlin-classes/debug, which that task reads. Without this edge
-// the build fails validation ("uses this output ... without declaring
-// an explicit or implicit dependency"). The task is created by AGP
-// after this script is evaluated, so it is wired up once all projects
-// are evaluated, when the task is guaranteed to exist.
+// Gradle validates that every task consuming extractDependencies'
+// output declares a dependency on it — extractDependencies writes
+// into kotlin-classes/debug, which compileDex, bundleLibRuntimeToJar
+// and the java-res tasks all read. The tasks are created by AGP
+// after this script is evaluated, so they are wired up once all
+// projects are evaluated, when they are guaranteed to exist.
 gradle.projectsEvaluated {
-    tasks.findByName("bundleLibRuntimeToJarDebug")?.dependsOn(extractDependencies)
+    listOf("bundleLibRuntimeToJarDebug", "processDebugJavaRes", "mergeDebugJavaResource").forEach { taskName ->
+        tasks.findByName(taskName)?.dependsOn(extractDependencies)
+    }
 }

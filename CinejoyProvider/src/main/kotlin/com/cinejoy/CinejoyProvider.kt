@@ -23,7 +23,6 @@ import com.lagradost.cloudstream3.toNewSearchResponseList
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import com.lagradost.cloudstream3.utils.newSubtitleFile
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
@@ -335,7 +334,7 @@ class CinejoyProvider : MainAPI() {
                             val subUrl = cap.optString("url")
                             val subLang = cap.optString("language", cap.optString("id", "en"))
                             if (subUrl.isNotBlank()) {
-                                subtitleCallback(newSubtitleFile(subLang, subUrl))
+                                subtitleCallback(SubtitleFile(subLang, subUrl))
                             }
                         }
 
@@ -422,7 +421,7 @@ class CinejoyProvider : MainAPI() {
                     val subLink = subObj.optString("url")
                     val subLang = subObj.optString("lang", "en")
                     if (subLink.isNotBlank()) {
-                        subtitleCallback(newSubtitleFile(subLang, subLink))
+                        subtitleCallback(SubtitleFile(subLang, subLink))
                     }
                 }
             }

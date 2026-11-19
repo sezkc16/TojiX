@@ -1,5 +1,5 @@
 // Use an integer for version numbers
-version = 1
+version = 2
 
 cloudstream {
     description = "Free Download Hollywood, Bollywood, Bangla, TV Series, Turkish/Chinese Movies, Korean Drama Series in Hindi Dubbed, English (Dual Audio), HEVC 10bit, K-Drama, Anime in Hindi — Watch Online"

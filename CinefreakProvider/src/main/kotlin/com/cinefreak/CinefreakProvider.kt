@@ -49,10 +49,14 @@ import java.util.concurrent.atomic.AtomicBoolean
 //   episodes (sources = the PLAY_API episode code).
 //
 // Stream wall (all paths Turnstile-gated):
-// - cinecloud /f/ "Watch Online": the page auto-solves Turnstile, then
-//   POSTs a=play (+ts + CSRF) to itself and sets the real file as the
-//   #cfPlayer iframe src. Without ts the server returns a 60 s DECOY mp4
-//   (see isDecoyUrl — NEVER emitted).
+// - cinecloud /f/ "Watch Online": the page renders Turnstile
+//   (appearance: 'interaction-only', in #cfTsBox), then POSTs a=play
+//   (+ts + CSRF) to itself and sets the real file as #cfVlc.href (on
+//   iOS there is no #cfPlayer element, only a JS reference to it).
+//   Without ts the server returns a 60 s DECOY mp4 (see isDecoyUrl —
+//   NEVER emitted). The Turnstile checkbox needs a human tick, so when
+//   the widget is waiting the script returns SHOW_SHEET and the app
+//   (b96+) shows the page in its check sheet for the person to tick.
 // - PLAY_API (embedded player, series): POST op=play&ep=<code> (+ts)
 //   -> a vidzer URL. Best effort; proven only on the phone.
 // - "Download Links": Turnstile + Google Drive OAuth — not usable, skipped.
@@ -180,11 +184,25 @@ class CinefreakProvider : MainAPI() {
     private fun parseQualities(doc: Document, cleanTitleText: String): List<QualityLink> {
         val out = mutableListOf<QualityLink>()
         val seen = mutableSetOf<String>()
-        for (block in doc.select("div.download-links-div > div")) {
-            val h4 = block.selectFirst("h4.movie-title")?.text()?.trim() ?: continue
-            val watch = block.selectFirst("a.dlbtn-watch")?.attr("href")?.trim() ?: continue
+        // One block per quality: an h4.movie-title followed by its
+        // div.dlbtn-container. Only the FIRST block is wrapped in its own
+        // div (div.c37b704); the rest are bare h4 + container siblings
+        // under div.download-links-div — so the v1 selector
+        // (div.download-links-div > div) found only the first block
+        // (480p) and missed the other five. Pair each h4 with the
+        // container that follows it instead. (418, 2026-11-20: 6 watch
+        // links — 480p, HEVC 720p, HD 720p, HD 1080p, HQ 1080p, 4K-2160p;
+        // the bare 480p block carries Download only, no Watch Online.)
+        val heads = doc.select("div.download-links-div h4.movie-title")
+            .ifEmpty { doc.select("h4.movie-title") }
+        for (h4 in heads) {
+            val label = qualityLabelFromH4(h4.text().trim(), cleanTitleText)
+            val container = h4.nextElementSiblings()
+                .firstOrNull { it.tagName() == "div" && it.hasClass("dlbtn-container") }
+                ?: continue
+            val watch = container.selectFirst("a.dlbtn-watch")?.attr("href")?.trim()
+                ?: continue
             if (!watch.startsWith("http")) continue
-            val label = qualityLabelFromH4(h4, cleanTitleText)
             if (!seen.add(label)) continue
             out.add(QualityLink(label, watch))
         }
@@ -438,15 +456,24 @@ class CinefreakProvider : MainAPI() {
 
     private data class SolveResult(val token: String?, val directUrl: String?)
 
+    // The marker the injected script returns when the Turnstile widget is
+    // waiting for a person to tick its checkbox (it renders
+    // appearance: 'interaction-only'): the app (b96+) shows the page in
+    // its check sheet so the person can tick it. Older apps ignore this
+    // and the resolve just times out; the script callback ignores it too.
+    private val showSheetMarker = "SHOW_SHEET"
+
     // Solves Turnstile for one page in the engine's hidden browser (real
     // WKWebView on iOS) and returns either the Turnstile token or a direct
-    // file URL the page itself resolved (its #cfPlayer iframe src). The
-    // injected script polls both after every request; when either appears
-    // it fires a same-origin signal request, which the intercept regex
-    // matches so the resolve ends at once instead of timing out. It also
-    // clicks the post page's .cft-start play overlay, because the embedded
-    // player is click-to-play (nothing loads until clicked).
-    private suspend fun solveTurnstile(pageUrl: String, timeoutMs: Long = 30_000L): SolveResult {
+    // file URL the page itself resolved (its #cfVlc href on iOS — the iOS
+    // /f/ page has no #cfPlayer element). The injected script polls both
+    // after every request; when either appears it fires a same-origin
+    // signal request, which the intercept regex matches so the resolve
+    // ends at once instead of timing out. It also clicks the post page's
+    // .cft-start play overlay, because the embedded player is
+    // click-to-play (nothing loads until clicked). 60 s (v2, was 30 s):
+    // the widget can take a while to render on a slow page.
+    private suspend fun solveTurnstile(pageUrl: String, timeoutMs: Long = 60_000L): SolveResult {
         val script = """
             (function(){
               var t = document.querySelector('input[name="cf-turnstile-response"]');
@@ -458,6 +485,12 @@ class CinefreakProvider : MainAPI() {
               if (!tok && !src && !vlc) {
                 var b = document.querySelector('.cft-start');
                 if (b) { try { b.click(); } catch(e) {} }
+                // The Turnstile widget is waiting for a person (it renders
+                // interaction-only, and the hidden page cannot tick it):
+                // ask the app to show this page in its check sheet.
+                var w = document.querySelector('#cfTsBox iframe') ||
+                        document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+                if (w) return 'SHOW_SHEET';
                 return '';
               }
               var out = tok ? ('TS:' + tok) : ('URL:' + (src || vlc));
@@ -469,7 +502,13 @@ class CinefreakProvider : MainAPI() {
         val resolver = WebViewResolver(
             interceptUrl = Regex("__cf_done__"),
             script = script,
-            scriptCallback = { result -> if (result.isNotBlank()) viaCallback.set(result) },
+            // The engine hands the script's return value back as JSON text
+            // (a string comes back quoted, e.g. '"TS:..."'), so strip the
+            // quotes; the SHOW_SHEET marker is not a result, ignore it.
+            scriptCallback = { result ->
+                val clean = result.trim().removeSurrounding("\"")
+                if (clean.isNotBlank() && clean != showSheetMarker) viaCallback.set(clean)
+            },
             timeout = timeoutMs
         )
         val raw: String? = try {
@@ -490,9 +529,14 @@ class CinefreakProvider : MainAPI() {
                 null
             )
 
+            // The iOS /f/ page has no #cfPlayer element (only a JS
+            // reference to it), so the file arrives as #cfVlc.href — a
+            // vlc:// URL. mpv cannot play vlc:// raw: unwrap it to the
+            // real file URL first.
             raw.startsWith("URL:") -> SolveResult(
                 null,
                 raw.removePrefix("URL:").takeIf { it.isNotBlank() }
+                    ?.let { if (it.startsWith("vlc")) extractFileFromVlc(it) else it }
             )
 
             else -> SolveResult(null, null)
@@ -621,10 +665,21 @@ class CinefreakProvider : MainAPI() {
         // quality on the post (the site: "One Turnstile per visitor").
         var token: String? = null
         val first = qualities.first()
-        val solve = solveTurnstile(first.watchUrl)
+        var solve = solveTurnstile(first.watchUrl)
         token = solve.token
         solve.directUrl?.let { url ->
             if (emitLink(callback, emitted, first.label, url, first.watchUrl)) found.set(true)
+        }
+        // Nothing came back (no token, no direct file): retry once on the
+        // same page. On a b96+ app the first solve already showed the page
+        // to the person, so the retry reuses the clearance they gave; on
+        // an older app it is a second chance for a slow widget.
+        if (token == null && !found.get()) {
+            solve = solveTurnstile(first.watchUrl)
+            token = solve.token
+            solve.directUrl?.let { url ->
+                if (emitLink(callback, emitted, first.label, url, first.watchUrl)) found.set(true)
+            }
         }
         // No token but the first quality resolved directly: try once more on
         // the best remaining quality to get a token for the rest.
@@ -667,7 +722,7 @@ class CinefreakProvider : MainAPI() {
             return false
         }
         val playApi = extractPlayApi(html) ?: return false
-        val solve = solveTurnstile(postUrl, timeoutMs = 20_000L)
+        val solve = solveTurnstile(postUrl)
         val token = solve.token ?: return false
         val res = try {
             app.post(

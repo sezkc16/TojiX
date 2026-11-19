@@ -164,11 +164,29 @@ class CinejoyProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        resolveDomain()
+        // v3: NO resolveDomain() here — TMDB rows do not need the site
+        // domain (mainUrl is only used to string-build item URLs), and
+        // the 4-candidate probe (up to 16 s worst case, paid 4x
+        // concurrently on first Home load) was a failure surface on the
+        // home path. load()/loadLinks() still resolve the domain where
+        // it matters.
+        // v3: this URL also carried a literal redacted key (v1 write),
+        // so TMDB 401'd every Home section while search/load (which use
+        // the tmdbKey variable) worked. Fixed to use the variable.
         val path = request.data.format(page)
         val delimiter = if (path.contains("?")) "&" else "?"
-        val url = "$tmdbBase/$path${delimiter}api_key=<redacted>"
-        val json = JSONObject(app.get(url).text)
+        val url = "$tmdbBase/$path${delimiter}api_key=$tmdbKey"
+        val res = app.get(url)
+        val json = JSONObject(res.text)
+        // v3: TMDB failures must THROW instead of returning an empty
+        // section. An empty section is swallowed silently at three layers
+        // (engine -> Dart -> fallback toast), so a TMDB error was
+        // indistinguishable from "no results" and left no trace anywhere.
+        // A throw is recorded by the engine as a per-section error.
+        if (!res.isSuccessful || json.has("status_code")) {
+            val msg = json.optString("status_message", "TMDB error")
+            throw RuntimeException("Cinejoy TMDB ${request.name}: HTTP ${res.code} $msg")
+        }
         val results = json.optJSONArray("results") ?: JSONArray()
         val isTvRow = request.data.contains("discover/tv")
         val items = mutableListOf<com.lagradost.cloudstream3.SearchResponse>()
@@ -180,7 +198,8 @@ class CinejoyProvider : MainAPI() {
     }
 
     override suspend fun search(query: String, page: Int): SearchResponseList? {
-        resolveDomain()
+        // v3: no resolveDomain() here either — search is TMDB-only, same
+        // reason as getMainPage.
         val encoded = java.net.URLEncoder.encode(query.trim(), "UTF-8")
         val url = "$tmdbBase/search/multi?query=$encoded&api_key=$tmdbKey&include_adult=false&page=$page"
         val json = JSONObject(app.get(url).text)

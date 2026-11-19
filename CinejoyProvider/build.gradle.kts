@@ -52,3 +52,12 @@ val extractDependencies by tasks.registering(Copy::class) {
 tasks.named("compileDex") {
     dependsOn(extractDependencies)
 }
+
+// Gradle validates that bundleLibRuntimeToJarDebug declares a dependency
+// on any task whose output it consumes — extractDependencies writes
+// into kotlin-classes/debug, which that task reads. Without this edge
+// the build fails validation ("uses this output ... without declaring
+// an explicit or implicit dependency").
+tasks.named("bundleLibRuntimeToJarDebug") {
+    dependsOn(extractDependencies)
+}

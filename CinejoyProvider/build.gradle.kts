@@ -57,7 +57,11 @@ tasks.named("compileDex") {
 // on any task whose output it consumes — extractDependencies writes
 // into kotlin-classes/debug, which that task reads. Without this edge
 // the build fails validation ("uses this output ... without declaring
-// an explicit or implicit dependency").
-tasks.named("bundleLibRuntimeToJarDebug") {
-    dependsOn(extractDependencies)
+// an explicit or implicit dependency"). The task is created by AGP
+// after this script is evaluated, so tasks.named() cannot see it yet —
+// hook task creation instead.
+tasks.whenTaskAdded {
+    if (name == "bundleLibRuntimeToJarDebug") {
+        dependsOn(extractDependencies)
+    }
 }

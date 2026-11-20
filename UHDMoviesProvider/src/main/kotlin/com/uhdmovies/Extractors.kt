@@ -77,10 +77,10 @@ class UHDMovies : ExtractorApi() {
  * button becomes one source row, tagged with its server so the row
  * shows where the file comes from.
  *
- * "Resume Cloud" is deliberately NOT emitted: its button resolves to
- * a .zip archive (Cloudflare Worker, application/x-zip) — a
- * download-only file the player cannot play, so the row failed
- * silently and Zeus auto-advanced past it (user report 2026-11-19).
+ * "Resume Cloud" IS emitted (restored in v3, user request 2026-11-20):
+ * its button resolves to a .zip archive (Cloudflare Worker,
+ * application/x-zip) — a download-only file the player cannot play.
+ * The row is a download path, not a playable stream.
  */
 open class Driveseed : ExtractorApi() {
     override val name = "Driveseed"
@@ -199,6 +199,17 @@ open class Driveseed : ExtractorApi() {
                     emitLink(callback, fileName, fileSize, quality, link, "[CF]")
                 }
             }
+            text.contains("Resume Cloud", ignoreCase = true) -> {
+                val resumeCloud = try {
+                    resumeCloudLink(baseUrl, href)
+                } catch (_: Exception) {
+                    null
+                } ?: return
+                emitLink(
+                    callback, fileName, fileSize, quality,
+                    resumeCloud, "[ResumeCloud]"
+                )
+            }
             text.contains("gofile", ignoreCase = true) -> {
                 loadExtractor(href, subtitleCallback, callback)
             }
@@ -274,6 +285,19 @@ open class Driveseed : ExtractorApi() {
             }
         }
         return downloadLinks
+    }
+
+    /** "Resume Cloud": first green download button on the page. */
+    private suspend fun resumeCloudLink(baseUrl: String, url: String): String? {
+        return try {
+            val target = if (url.startsWith("http")) url
+            else fixUrlWithBase(url, baseUrl)
+            app.get(target).document.selectFirst("a.btn-success")
+                ?.attr("href")
+                ?.takeIf { it.startsWith("http") }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /** "Resume Worker Bot": the page plants a token + download id in JS;

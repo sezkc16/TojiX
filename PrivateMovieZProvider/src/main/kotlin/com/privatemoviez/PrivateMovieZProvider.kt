@@ -76,6 +76,35 @@ import org.jsoup.Jsoup
 //   returning null, (4) an explicit 3xx Location is honoured even
 //   if the client did not follow it. Total stays inside the app's
 //   ~30s loadLinks budget (pre-pass capped once 20s is spent).
+// - v4 fixes (phone-tested v3 bug, 2026-11-21 02:51 — "No streams
+//   found" on Play STILL, fresh screenshot): v3's WebView-solve
+//   theory was right about the challenge but WRONG about what the
+//   token page does — it does NOT 302 to the real host. Verified in
+//   a live browser 2026-11-21 02:52: after the "Just a moment..."
+//   auto-check clears (no CAPTCHA, no click), the token renders a
+//   PMSLink LANDING page at the SAME URL ("Scream 7 (2026) ... [PMZ]
+//   .mkv – PMSLink", single file, no size, no countdown) with THREE
+//   download buttons, all https://pmslink.lol/dl/?t=<token>:
+//   "[H-Cloud] Resumable", "Download Now [GD]", "Download Now [FP]".
+//   v3 read the landing body, found no hubcloud code, returned null,
+//   and loadLinks returned nothing — that is the exact break. v4:
+//   (1) resolvePmsLink returns the landing HTML (PmsResult.Landing)
+//   instead of null, (2) parsePmsLandingButtons extracts the three
+//   /dl/?t= buttons, (3) followPmsDl follows each one (same
+//   Cloudflare retry + Referer) to its FINAL host at runtime and
+//   dispatches on the actual URL — H-Cloud -> HubCloud servers
+//   (resolveHubCloudServers), GD -> Google Drive / GDFlix, FP ->
+//   FilePress via CloudStream's built-in loadExtractor (same pattern
+//   as Movies4u / GokuHD). The /dl/ final hosts could NOT be
+//   identified from the VM (whole pmslink.lol domain 403s plain
+//   fetches, 2026-11-21 02:53), so v4 never guesses from the button
+//   label — it follows and dispatches on what it finds. The whole
+//   pmslink phase (token + /dl/ follows) stays sequential under one
+//   shared 25s deadline so loadLinks fits the ~30s budget.
+//   (5) emitTarget's catch-all now tries loadExtractor first and
+//   only emits a raw URL directly when it looks like a direct file,
+//   so an intermediate page's stray/ad links never become broken
+//   source rows.
 class PrivateMovieZProvider : MainAPI() {
 
     override var mainUrl = "https://b.privatemoviez.surf"
@@ -101,14 +130,20 @@ class PrivateMovieZProvider : MainAPI() {
     // (verified live 2026-11-21: EVERY download button on every post
     // points here, e.g. https://pmslink.lol/b23fea8764/ for Scream 7
     // 2160p; v1 did not know this host, so every link was dropped and
-    // load() returned nothing). The token page 302-redirects to the real
-    // host (HubDrive/HubCloud/GreenMotors/...); resolve it in loadLinks.
+    // load() returned nothing). The token page does NOT 302 to the
+    // real host (v3's assumption, wrong — verified in a live browser
+    // 2026-11-21 02:52): it renders a PMSLink LANDING page at the
+    // SAME URL with three download buttons (https://pmslink.lol/
+    // dl/?t=<token>): "[H-Cloud] Resumable", "Download Now [GD]",
+    // "Download Now [FP]". Resolve the full chain in loadLinks:
+    // resolvePmsLink (landing HTML) -> parsePmsLandingButtons ->
+    // followPmsDl (final host) -> emitTarget.
     // NOTE: pmslink sits behind a Cloudflare managed challenge — from a
     // datacenter IP it 403s. On the phone the app's ClearanceInterceptor
     // solves the challenge in a hidden WebView and stores the clearance
-    // per site, so v3 resolves pmslink tokens SEQUENTIALLY (one solve
+    // per site, so v3/v4 resolve pmslink tokens SEQUENTIALLY (one solve
     // warms the clearance for the rest) with a retry loop and long
-    // per-attempt timeouts — see resolvePmsLinkTarget.
+    // per-attempt timeouts — see resolvePmsLink / followPmsDl.
     data class LinkEntry(
         @JsonProperty("label") val label: String,
         @JsonProperty("host") val host: String,
@@ -770,22 +805,52 @@ class PrivateMovieZProvider : MainAPI() {
         return true
     }
 
-    // pmslink.lol/<token> -> the real host URL. The token page
-    // 302-redirects to the real host (HubDrive / HubCloud / GreenMotors /
-    // ...). The token page sits behind a Cloudflare MANAGED challenge:
-    // plain HTTP gets a 403 "Just a moment..." page from datacenter IPs,
-    // but on the phone the app's ClearanceInterceptor detects the
-    // challenge and solves it in a hidden WebView, storing a
-    // cf_clearance cookie for pmslink.lol — so the retry has to give
-    // that solve time to finish. Retries: attempt 1 with a 15s
-    // timeout (the solve usually needs 3-8s), then a 3s pause and
-    // attempt 2 with 10s (the clearance is stored by then, so it is
-    // fast). A challenge page is retried, never treated as a target.
-    // Returns the final URL after redirects, or a HubCloud drive URL
-    // when a code is embedded in the page; null when the challenge
-    // never clears.
-    private suspend fun resolvePmsLinkTarget(tokenUrl: String, retries: Int = 2): String? {
+    // Result of resolving one pmslink.lol/<token>.
+    private sealed class PmsResult {
+        // The token 302-redirected straight to a real host (or the
+        // page embedded a hubcloud drive code).
+        data class Direct(val url: String) : PmsResult()
+        // The token rendered the PMSLink landing page at the SAME URL
+        // — its /dl/?t= buttons must be followed (see
+        // parsePmsLandingButtons + followPmsDl).
+        data class Landing(val html: String) : PmsResult()
+        object None : PmsResult()
+    }
+
+    // pmslink.lol/<token> -> the real host URL(s). v3 assumed the token
+    // page 302-redirects to the real host — it does NOT (verified in a
+    // live browser 2026-11-21 02:52): after the Cloudflare managed
+    // challenge clears, the token renders a PMSLink LANDING page at the
+    // SAME URL ("Scream 7 (2026) ... [PMZ].mkv – PMSLink", single file,
+    // no size, no countdown) with THREE download buttons:
+    //   "[H-Cloud] Resumable" -> /dl/?t=<token>  (HubCloud, 10 Gbps)
+    //   "Download Now [GD]"   -> /dl/?t=<token>  (Google Drive / GDFlix)
+    //   "Download Now [FP]"   -> /dl/?t=<token>  (FilePress)
+    // v3 read the landing body, found no hubcloud code, and returned
+    // null -> loadLinks returned nothing -> "No streams found" on the
+    // phone even on v3 (02:51). So this returns the landing HTML
+    // (PmsResult.Landing) instead of null; the caller follows the
+    // /dl/?t= buttons (followPmsDl). The token page sits behind a
+    // Cloudflare MANAGED challenge: plain HTTP gets a 403 "Just a
+    // moment..." page from datacenter IPs, but on the phone the app's
+    // ClearanceInterceptor detects the challenge and solves it in a
+    // hidden WebView, storing a cf_clearance cookie for pmslink.lol —
+    // so the retry has to give that solve time to finish. Retries:
+    // attempt 1 with a 15s timeout (the solve usually needs 3-8s),
+    // then a 3s pause and attempt 2 with 10s (the clearance is stored
+    // by then, so it is fast). A challenge page is retried, never
+    // treated as a target. Returns Direct when the token 302s off
+    // pmslink (or embeds a hubcloud code), Landing for the landing
+    // page, None when the challenge never clears. deadlineMs is the
+    // shared cut-off for the whole pmslink phase: a retry is skipped
+    // once it is passed.
+    private suspend fun resolvePmsLink(
+        tokenUrl: String,
+        retries: Int = 2,
+        deadlineMs: Long = Long.MAX_VALUE,
+    ): PmsResult {
         for (attempt in 0 until retries) {
+            if (attempt > 0 && System.currentTimeMillis() > deadlineMs) return PmsResult.None
             val timeout = if (attempt == 0) 15L else 10L
             val resp = try {
                 app.get(tokenUrl, headers = browserHeaders, timeout = timeout)
@@ -796,14 +861,14 @@ class PrivateMovieZProvider : MainAPI() {
             // A 3xx Location is the redirect target even if the client
             // did not follow it.
             val loc = resp.headers["Location"] ?: resp.headers["location"] ?: ""
-            if (loc.startsWith("http") && !loc.contains("pmslink.lol")) return loc
+            if (loc.startsWith("http") && !loc.contains("pmslink.lol")) return PmsResult.Direct(loc)
             // Final URL after redirects (OkHttp follows them by default).
             val finalUrl = try {
                 resp.okhttpResponse.request.url.toString()
             } catch (e: Exception) { "" }
-            if (finalUrl.isNotEmpty() && !finalUrl.contains("pmslink.lol")) return finalUrl
+            if (finalUrl.isNotEmpty() && !finalUrl.contains("pmslink.lol")) return PmsResult.Direct(finalUrl)
             // Still on pmslink: read the (small) body to tell a
-            // challenge page from a page that embeds the target.
+            // challenge page from the landing page.
             val body = try { resp.text } catch (e: Exception) { "" }
             val challenged = resp.code == 403 || resp.code == 503
                 || finalUrl.contains("__cf_chl")
@@ -812,14 +877,147 @@ class PrivateMovieZProvider : MainAPI() {
                 || body.contains("_cf_chl_opt")
             if (!challenged) {
                 val code = hubCloudCode(body)
-                if (code != null) return "https://hubcloud.ist/drive/$code"
-                // A 200 that is neither a redirect nor a challenge and
-                // has no hubcloud code: nothing more to get here.
-                return null
+                if (code != null) return PmsResult.Direct("https://hubcloud.ist/drive/$code")
+                if (body.isNotEmpty()) return PmsResult.Landing(body)
+                return PmsResult.None
             }
             if (attempt + 1 < retries) Thread.sleep(3000)
         }
-        return null
+        return PmsResult.None
+    }
+
+    // Result of following one PMSLink /dl/?t= button.
+    private sealed class DlResult {
+        // The button 302-redirected (or landed) on a real host URL.
+        data class Url(val url: String) : DlResult()
+        // The button rendered an intermediate HTML page instead of a
+        // redirect — sweep it for resolvable links.
+        data class Page(val html: String) : DlResult()
+        object None : DlResult()
+    }
+
+    // The PMSLink landing page's download buttons (verified live in a
+    // browser 2026-11-21 02:52, Scream 7 2160p):
+    //   "[H-Cloud] Resumable" -> https://pmslink.lol/dl/?t=64608ee3...
+    //   "Download Now [GD]"   -> https://pmslink.lol/dl/?t=fc09fa57...
+    //   "Download Now [FP]"   -> https://pmslink.lol/dl/?t=7c61991e...
+    // Page order is kept (H-Cloud first — it is the recommended
+    // HubCloud 10 Gbps path), so a budget cut-off still leaves the
+    // best button resolved. Returns (button label, dl URL) pairs.
+    private fun parsePmsLandingButtons(html: String): List<Pair<String, String>> {
+        val doc = Jsoup.parse(html)
+        val out = mutableListOf<Pair<String, String>>()
+        val seen = mutableSetOf<String>()
+        for (a in doc.select("a[href*=\"/dl/?t=\"], a[href*=\"pmslink.lol/dl/\"]")) {
+            val href = a.attr("href")
+            if (href.isEmpty() || !seen.add(href)) continue
+            val url = if (href.startsWith("http")) href else "https://pmslink.lol$href"
+            val label = cleanText(a.text()).ifEmpty { "Download" }
+            out.add(label to url)
+        }
+        // Regex fallback on the raw HTML (buttons rendered by JS or
+        // hidden in attributes with no plain anchor).
+        if (out.isEmpty()) {
+            Regex("https?://pmslink\\.lol/dl/\\?t=[A-Za-z0-9]+")
+                .findAll(html).map { it.value }.distinct().forEach { out.add("Download" to it) }
+        }
+        return out
+    }
+
+    // Follow one PMSLink /dl/?t= button to its final host. The final
+    // hosts were NOT identifiable from the VM (the whole pmslink.lol
+    // domain 403s plain fetches — token 403, /dl/ 403 / connection
+    // failures, 2026-11-21 02:53), so this resolves them AT RUNTIME on
+    // the phone, where the cf_clearance cookie is already warm from
+    // the token fetch, and the caller dispatches on the ACTUAL final
+    // URL instead of guessing from the button label ([H-Cloud] ->
+    // HubCloud, [GD] -> Google Drive / GDFlix, [FP] -> FilePress —
+    // the labels are only hints). Same Cloudflare retry as the token
+    // page, plus a Referer (the landing page) since /dl/ endpoints
+    // commonly check it. A 3xx Location is honoured even if the
+    // client did not follow it; a 200 HTML page is returned for
+    // sweeping. deadlineMs skips the retry once the shared pmslink
+    // budget is spent.
+    private suspend fun followPmsDl(
+        dlUrl: String,
+        referer: String,
+        retries: Int = 2,
+        deadlineMs: Long = Long.MAX_VALUE,
+    ): DlResult {
+        for (attempt in 0 until retries) {
+            if (attempt > 0 && System.currentTimeMillis() > deadlineMs) return DlResult.None
+            val timeout = if (attempt == 0) 15L else 10L
+            val headers = browserHeaders + ("Referer" to referer)
+            val resp = try {
+                app.get(dlUrl, headers = headers, timeout = timeout)
+            } catch (e: Exception) {
+                if (attempt + 1 < retries) Thread.sleep(3000)
+                continue
+            }
+            val loc = resp.headers["Location"] ?: resp.headers["location"] ?: ""
+            if (loc.startsWith("http") && !loc.contains("pmslink.lol")) return DlResult.Url(loc)
+            val finalUrl = try {
+                resp.okhttpResponse.request.url.toString()
+            } catch (e: Exception) { "" }
+            if (finalUrl.isNotEmpty() && !finalUrl.contains("pmslink.lol")) return DlResult.Url(finalUrl)
+            val body = try { resp.text } catch (e: Exception) { "" }
+            val challenged = resp.code == 403 || resp.code == 503
+                || finalUrl.contains("__cf_chl")
+                || body.contains("Just a moment")
+                || body.contains("challenges.cloudflare.com")
+                || body.contains("_cf_chl_opt")
+            if (!challenged) {
+                val code = hubCloudCode(body)
+                if (code != null) return DlResult.Url("https://hubcloud.ist/drive/$code")
+                if (body.isNotEmpty()) return DlResult.Page(body)
+                return DlResult.None
+            }
+            if (attempt + 1 < retries) Thread.sleep(3000)
+        }
+        return DlResult.None
+    }
+
+    // Turn one resolved pmslink token into the list of final target
+    // URLs (one per /dl/?t= button). The /dl/ follows run here,
+    // SEQUENTIALLY — they are pmslink.lol fetches, and concurrent
+    // solves for the same host contend (the v2 lesson). `deadlineMs`
+    // is the shared cut-off for the whole pmslink phase: once it is
+    // passed, remaining buttons are left unresolved so loadLinks
+    // still fits the app's ~30s budget. Buttons are followed in
+    // page order, so the H-Cloud (HubCloud) button resolves first.
+    private suspend fun collectPmsTargets(
+        tokenUrl: String,
+        result: PmsResult,
+        deadlineMs: Long,
+    ): List<String> {
+        val out = mutableListOf<String>()
+        when (result) {
+            is PmsResult.Direct -> out.add(result.url)
+            is PmsResult.Landing -> {
+                val code = hubCloudCode(result.html)
+                if (code != null) out.add("https://hubcloud.ist/drive/$code")
+                for ((_, dlUrl) in parsePmsLandingButtons(result.html)) {
+                    if (System.currentTimeMillis() > deadlineMs) break
+                    when (val dl = followPmsDl(dlUrl, tokenUrl, deadlineMs = deadlineMs)) {
+                        is DlResult.Url -> out.add(dl.url)
+                        is DlResult.Page -> {
+                            // Intermediate page: sweep it for anything
+                            // resolvable (never a pmslink URL — those
+                            // would loop back into this same chain).
+                            val doc = Jsoup.parse(dl.html)
+                            for (a in doc.select("a[href^=http]")) {
+                                val href = a.attr("href")
+                                if (href.isEmpty() || href.contains("pmslink.lol")) continue
+                                out.add(href)
+                            }
+                        }
+                        DlResult.None -> { /* this button did not resolve; try the next */ }
+                    }
+                }
+            }
+            PmsResult.None -> { /* nothing */ }
+        }
+        return out.distinct()
     }
 
     // Emit links for an already-resolved target URL (a pmslink landing,
@@ -892,22 +1090,48 @@ class PrivateMovieZProvider : MainAPI() {
                     }
                 }
             }
+            target.contains("filepress") || target.contains("vcloud") || target.contains("vdrive") -> {
+                // FilePress / V-Cloud / V-Drive: CloudStream's built-in
+                // extractors handle them (same pattern as Movies4u /
+                // GokuHD). This is the PMSLink "[FP]" button's path.
+                if (loadExtractor(target, subtitleCallback, callback)) found = true
+            }
             target.startsWith("http") -> {
-                callback(
-                    newExtractorLink(
-                        source = "HubCloud",
-                        name = "HubCloud $label",
-                        url = target,
-                        type = ExtractorLinkType.VIDEO
-                    ) {
-                        this.quality = quality
-                        this.referer = "https://hubcloud.pw/"
-                    }
-                )
-                found = true
+                // Unknown host: let CloudStream's built-in extractors
+                // try first (they cover many file hosts). Only emit
+                // the raw URL directly when it looks like a direct
+                // file — emitting a random page/ad URL as a "video"
+                // link would only show a broken source row.
+                if (loadExtractor(target, subtitleCallback, callback)) {
+                    found = true
+                } else if (isDirectFileUrl(target)) {
+                    callback(
+                        newExtractorLink(
+                            source = "HubCloud",
+                            name = "HubCloud $label",
+                            url = target,
+                            type = ExtractorLinkType.VIDEO
+                        ) {
+                            this.quality = quality
+                            this.referer = "https://hubcloud.pw/"
+                        }
+                    )
+                    found = true
+                }
             }
         }
         return found
+    }
+
+    // A URL that is (probably) a direct video file, not a web page:
+    // a video extension, or a known file-delivery host.
+    private fun isDirectFileUrl(url: String): Boolean {
+        val lower = url.lowercase()
+        return lower.contains(".mp4") || lower.contains(".mkv") || lower.contains(".webm")
+            || lower.contains(".m3u8") || lower.contains(".mpd")
+            || lower.contains("r2.cloudflarestorage.com")
+            || lower.contains("video-downloads.googleusercontent.com")
+            || lower.contains("pixeldrain.dev/api/file/")
     }
 
     override suspend fun loadLinks(
@@ -925,19 +1149,29 @@ class PrivateMovieZProvider : MainAPI() {
         // managed challenge, which the app clears in a hidden WebView
         // and stores per-site — three concurrent solves for the same
         // host contend and can all fail, so the first token warms the
-        // clearance and the rest reuse it. The pre-pass is capped: once
-        // 20s is spent, further tokens are left unresolved (null) so the
-        // rest of loadLinks still fits the app's ~30s budget.
-        val pmsTargets = mutableMapOf<String, String?>()
+        // clearance and the rest reuse it. The token does NOT 302 to
+        // the real host (v3's assumption, wrong): it renders a PMSLink
+        // landing page whose /dl/?t= buttons are followed here too,
+        // still sequentially (they are pmslink.lol fetches as well).
+        // The whole pmslink phase is capped by one shared deadline
+        // (25s) so loadLinks still fits the app's ~30s budget;
+        // buttons are followed in page order (H-Cloud first), so a
+        // cut-off still leaves the best button resolved.
+        val pmsTargets = mutableMapOf<String, List<String>>()
         val pmsStart = System.currentTimeMillis()
+        val pmsDeadline = pmsStart + 25_000
         for (entry in entries) {
             if (entry.host != "pmslink") continue
             if (entry.id in pmsTargets) continue
-            if (System.currentTimeMillis() - pmsStart > 20_000) {
-                pmsTargets[entry.id] = null
+            if (System.currentTimeMillis() > pmsDeadline) {
+                pmsTargets[entry.id] = emptyList()
                 continue
             }
-            pmsTargets[entry.id] = resolvePmsLinkTarget(entry.id)
+            pmsTargets[entry.id] = collectPmsTargets(
+                entry.id,
+                resolvePmsLink(entry.id, deadlineMs = pmsDeadline),
+                pmsDeadline,
+            )
         }
 
         // Resolve every entry concurrently: each one costs several HTTP
@@ -949,7 +1183,7 @@ class PrivateMovieZProvider : MainAPI() {
             val hubCdn: String?,
             val servers: List<HubServer>,
             val subs: List<LinkEntry>,
-            val target: String? = null,
+            val targets: List<String> = emptyList(),
         )
 
         val resolved: List<ResolvedEntry> = entries.amap { entry ->
@@ -959,7 +1193,7 @@ class PrivateMovieZProvider : MainAPI() {
                 "gm" -> ResolvedEntry(null, resolveGmEntry(entry.id), emptyList())
                 "hubcloud" -> ResolvedEntry(null, resolveHubCloudServers(entry.id), emptyList())
                 "archive" -> ResolvedEntry(null, emptyList(), fetchArchiveLinks(entry.id))
-                "pmslink" -> ResolvedEntry(null, emptyList(), emptyList(), pmsTargets[entry.id])
+                "pmslink" -> ResolvedEntry(null, emptyList(), emptyList(), pmsTargets[entry.id] ?: emptyList())
                 else -> ResolvedEntry(null, emptyList(), emptyList())
             }
         }
@@ -1006,8 +1240,12 @@ class PrivateMovieZProvider : MainAPI() {
                     if (loadExtractor(entry.id, subtitleCallback, callback)) found = true
                 }
                 "pmslink" -> {
-                    val target = res.target ?: return@forEach
-                    if (emitTarget(entry.label, entry.quality, target, subtitleCallback, callback)) found = true
+                    // One final target URL per /dl/?t= button (plus a
+                    // direct redirect / embedded hubcloud code, when
+                    // the token resolved that way).
+                    for (target in res.targets) {
+                        if (emitTarget(entry.label, entry.quality, target, subtitleCallback, callback)) found = true
+                    }
                 }
             }
         }

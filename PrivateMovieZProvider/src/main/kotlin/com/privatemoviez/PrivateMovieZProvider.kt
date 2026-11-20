@@ -786,7 +786,7 @@ class PrivateMovieZProvider : MainAPI() {
     // never clears.
     private suspend fun resolvePmsLinkTarget(tokenUrl: String, retries: Int = 2): String? {
         for (attempt in 0 until retries) {
-            val timeout = if (attempt == 0) 15 else 10
+            val timeout = if (attempt == 0) 15L else 10L
             val resp = try {
                 app.get(tokenUrl, headers = browserHeaders, timeout = timeout)
             } catch (e: Exception) {

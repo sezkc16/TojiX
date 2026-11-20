@@ -57,6 +57,25 @@ import org.jsoup.Jsoup
 //       .note-content div, not next to the <h3> — v1's sibling walk
 //       found nothing. v2 reads .note-wrap > .note-content p; no
 //       synopsis -> empty description (never fabricated).
+// - v3 fixes (phone-tested v2 bug, 2026-11-21 02:33 — "No streams
+//   found" on Play even though load() now works): the pmslink token
+//   page is behind a Cloudflare MANAGED challenge. Plain HTTP 403s
+//   from datacenter IPs, but the APP clears it: the engine's
+//   ClearanceInterceptor detects the challenge and solves it in a
+//   hidden WebView, storing a cf_clearance cookie per site
+//   (verified in the engine: ClearanceInterceptor + WebClearanceStore
+//   + RemoteWebViewHost.solveCloudflare). v2's resolver did ONE plain
+//   app.get with the default timeout and gave up on 403 — and it
+//   fired all three token fetches CONCURRENTLY via amap, so three
+//   WebView solves for the same host contended. v3: (1) pmslink
+//   tokens resolve SEQUENTIALLY in a pre-pass (first token warms
+//   the clearance, the rest reuse it), (2) each token gets a retry
+//   loop with a long per-attempt timeout (15s, then 10s) so the
+//   hidden-WebView solve has time to finish, (3) a challenge page
+//   (403 / "Just a moment" / __cf_chl) is retried instead of
+//   returning null, (4) an explicit 3xx Location is honoured even
+//   if the client did not follow it. Total stays inside the app's
+//   ~30s loadLinks budget (pre-pass capped once 20s is spent).
 class PrivateMovieZProvider : MainAPI() {
 
     override var mainUrl = "https://b.privatemoviez.surf"
@@ -85,9 +104,11 @@ class PrivateMovieZProvider : MainAPI() {
     // load() returned nothing). The token page 302-redirects to the real
     // host (HubDrive/HubCloud/GreenMotors/...); resolve it in loadLinks.
     // NOTE: pmslink sits behind a Cloudflare managed challenge — from a
-    // datacenter IP it 403s. Phones on residential/mobile IPs usually
-    // get the redirect directly; if the challenge fires, the entry is
-    // skipped (no crash).
+    // datacenter IP it 403s. On the phone the app's ClearanceInterceptor
+    // solves the challenge in a hidden WebView and stores the clearance
+    // per site, so v3 resolves pmslink tokens SEQUENTIALLY (one solve
+    // warms the clearance for the rest) with a retry loop and long
+    // per-attempt timeouts — see resolvePmsLinkTarget.
     data class LinkEntry(
         @JsonProperty("label") val label: String,
         @JsonProperty("host") val host: String,
@@ -751,22 +772,53 @@ class PrivateMovieZProvider : MainAPI() {
 
     // pmslink.lol/<token> -> the real host URL. The token page
     // 302-redirects to the real host (HubDrive / HubCloud / GreenMotors /
-    // ...). Returns the final URL after redirects, or a HubCloud drive URL
-    // when a code is embedded in the page. Returns null when the
-    // Cloudflare managed challenge is served instead of the redirect
-    // (datacenter IPs get challenged; phones on residential / mobile IPs
-    // usually get the redirect directly).
-    private suspend fun resolvePmsLinkTarget(tokenUrl: String): String? {
-        val resp = try {
-            app.get(tokenUrl, headers = browserHeaders)
-        } catch (e: Exception) { return null }
-        if (resp.code == 403) return null
-        val finalUrl = try {
-            resp.okhttpResponse.request.url.toString()
-        } catch (e: Exception) { "" }
-        if (finalUrl.isNotEmpty() && !finalUrl.contains("pmslink.lol")) return finalUrl
-        val code = hubCloudCode(resp.text)
-        if (code != null) return "https://hubcloud.ist/drive/$code"
+    // ...). The token page sits behind a Cloudflare MANAGED challenge:
+    // plain HTTP gets a 403 "Just a moment..." page from datacenter IPs,
+    // but on the phone the app's ClearanceInterceptor detects the
+    // challenge and solves it in a hidden WebView, storing a
+    // cf_clearance cookie for pmslink.lol — so the retry has to give
+    // that solve time to finish. Retries: attempt 1 with a 15s
+    // timeout (the solve usually needs 3-8s), then a 3s pause and
+    // attempt 2 with 10s (the clearance is stored by then, so it is
+    // fast). A challenge page is retried, never treated as a target.
+    // Returns the final URL after redirects, or a HubCloud drive URL
+    // when a code is embedded in the page; null when the challenge
+    // never clears.
+    private suspend fun resolvePmsLinkTarget(tokenUrl: String, retries: Int = 2): String? {
+        for (attempt in 0 until retries) {
+            val timeout = if (attempt == 0) 15 else 10
+            val resp = try {
+                app.get(tokenUrl, headers = browserHeaders, timeout = timeout)
+            } catch (e: Exception) {
+                if (attempt + 1 < retries) Thread.sleep(3000)
+                continue
+            }
+            // A 3xx Location is the redirect target even if the client
+            // did not follow it.
+            val loc = resp.headers["Location"] ?: resp.headers["location"] ?: ""
+            if (loc.startsWith("http") && !loc.contains("pmslink.lol")) return loc
+            // Final URL after redirects (OkHttp follows them by default).
+            val finalUrl = try {
+                resp.okhttpResponse.request.url.toString()
+            } catch (e: Exception) { "" }
+            if (finalUrl.isNotEmpty() && !finalUrl.contains("pmslink.lol")) return finalUrl
+            // Still on pmslink: read the (small) body to tell a
+            // challenge page from a page that embeds the target.
+            val body = try { resp.text } catch (e: Exception) { "" }
+            val challenged = resp.code == 403 || resp.code == 503
+                || finalUrl.contains("__cf_chl")
+                || body.contains("Just a moment")
+                || body.contains("challenges.cloudflare.com")
+                || body.contains("_cf_chl_opt")
+            if (!challenged) {
+                val code = hubCloudCode(body)
+                if (code != null) return "https://hubcloud.ist/drive/$code"
+                // A 200 that is neither a redirect nor a challenge and
+                // has no hubcloud code: nothing more to get here.
+                return null
+            }
+            if (attempt + 1 < retries) Thread.sleep(3000)
+        }
         return null
     }
 
@@ -868,10 +920,31 @@ class PrivateMovieZProvider : MainAPI() {
         var found = false
         val entries = ep.links ?: return false
 
+        // pmslink tokens resolve SEQUENTIALLY first, before the
+        // concurrent pass below. The token page is behind a Cloudflare
+        // managed challenge, which the app clears in a hidden WebView
+        // and stores per-site — three concurrent solves for the same
+        // host contend and can all fail, so the first token warms the
+        // clearance and the rest reuse it. The pre-pass is capped: once
+        // 20s is spent, further tokens are left unresolved (null) so the
+        // rest of loadLinks still fits the app's ~30s budget.
+        val pmsTargets = mutableMapOf<String, String?>()
+        val pmsStart = System.currentTimeMillis()
+        for (entry in entries) {
+            if (entry.host != "pmslink") continue
+            if (entry.id in pmsTargets) continue
+            if (System.currentTimeMillis() - pmsStart > 20_000) {
+                pmsTargets[entry.id] = null
+                continue
+            }
+            pmsTargets[entry.id] = resolvePmsLinkTarget(entry.id)
+        }
+
         // Resolve every entry concurrently: each one costs several HTTP
         // hops, and resolving them one after another regularly blows the
         // app's 30s loadLinks timeout. amap is CloudStream's own
-        // concurrent map (no kotlinx import needed).
+        // concurrent map (no kotlinx import needed). pmslink entries
+        // use the pre-resolved targets above (no second fetch).
         data class ResolvedEntry(
             val hubCdn: String?,
             val servers: List<HubServer>,
@@ -886,7 +959,7 @@ class PrivateMovieZProvider : MainAPI() {
                 "gm" -> ResolvedEntry(null, resolveGmEntry(entry.id), emptyList())
                 "hubcloud" -> ResolvedEntry(null, resolveHubCloudServers(entry.id), emptyList())
                 "archive" -> ResolvedEntry(null, emptyList(), fetchArchiveLinks(entry.id))
-                "pmslink" -> ResolvedEntry(null, emptyList(), emptyList(), resolvePmsLinkTarget(entry.id))
+                "pmslink" -> ResolvedEntry(null, emptyList(), emptyList(), pmsTargets[entry.id])
                 else -> ResolvedEntry(null, emptyList(), emptyList())
             }
         }

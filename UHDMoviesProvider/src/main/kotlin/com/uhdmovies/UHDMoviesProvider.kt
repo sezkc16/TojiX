@@ -456,10 +456,25 @@ class UHDMoviesProvider : MainAPI() {
         if (isDirectLink(link)) {
             return loadExtractor(link, subtitleCallback, callback)
         }
-        val first = try {
+        // v4: driveseed/thenaukriadda sometimes hang a request for 30 s+
+        // and the first gate walk comes back null. Retry the walk once
+        // after a short pause before giving up on the link — one
+        // transient stall must not yield "No streams found".
+        var first = try {
             bypassHrefli(link)
         } catch (_: Exception) {
             null
+        }
+        if (first == null) {
+            try {
+                Thread.sleep(1500)
+            } catch (_: InterruptedException) {
+            }
+            first = try {
+                bypassHrefli(link)
+            } catch (_: Exception) {
+                null
+            }
         }
         if (first == null) {
             return loadExtractor(link, subtitleCallback, callback)
@@ -474,7 +489,7 @@ class UHDMoviesProvider : MainAPI() {
         } catch (_: Exception) {
             null
         }
-        return loadExtractor(second ?: link, subtitleCallback, callback)
+        return loadExtractor(second ?: first, subtitleCallback, callback)
     }
 
     private fun isDirectLink(link: String): Boolean {

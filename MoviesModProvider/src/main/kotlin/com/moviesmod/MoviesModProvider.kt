@@ -583,10 +583,24 @@ class MoviesModProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val first = try {
+        // v4: same retry as UHDMovies — a transient gate stall must not
+        // kill the link on the first null walk.
+        var first = try {
             bypassHrefli(link)
         } catch (_: Exception) {
             null
+        }
+        if (first == null) {
+            // No kotlinx delay in providers by repo rule — a short block.
+            try {
+                Thread.sleep(1500)
+            } catch (_: InterruptedException) {
+            }
+            first = try {
+                bypassHrefli(link)
+            } catch (_: Exception) {
+                null
+            }
         }
         if (first != null) {
             return loadExtractor(first, subtitleCallback, callback)

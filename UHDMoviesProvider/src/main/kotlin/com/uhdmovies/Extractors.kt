@@ -11,6 +11,7 @@ import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import okhttp3.FormBody
 import org.json.JSONObject
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.util.Locale
 
@@ -97,28 +98,45 @@ open class Driveseed : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val baseUrl = getBaseUrl(url)
-        val document = try {
-            if (url.contains("r?key=")) {
-                val res = app.get(url)
-                val temp = Regex("replace\\(\\s*[\"']([^\"']+)[\"']")
-                    .find(res.text)?.groupValues?.getOrNull(1)
-                    ?: res.document.selectFirst("script:containsData(replace)")
-                        ?.data()
-                        ?.substringAfter("replace(\"", "")
-                        ?.substringBefore("\")", "")
-                    ?: res.document.selectFirst("script")
-                        ?.data()
-                        ?.substringAfter("replace(\"", "")
-                        ?.substringBefore("\")", "")
-                    ?: ""
-                if (temp.isBlank()) return
-                app.get(fixUrlWithBase(temp.replace("\\/", "/"), baseUrl)).document
-            } else {
-                app.get(url).document
+        // v4: driveseed.org intermittently hangs a request for 30 s+
+        // (observed live: one landing GET read-timed-out at 30 s, the
+        // same URL answered in 0.78 s a minute later). Fetch the landing
+        // page with a per-attempt timeout and retry once, so one stall
+        // cannot eat the whole 180 s load budget or kill the link.
+        suspend fun fetchLanding(): Document? {
+            return try {
+                if (url.contains("r?key=")) {
+                    val res = app.get(url, timeout = 15)
+                    val temp = Regex("replace\\(\\s*[\"']([^\"']+)[\"']")
+                        .find(res.text)?.groupValues?.getOrNull(1)
+                        ?: res.document.selectFirst("script:containsData(replace)")
+                            ?.data()
+                            ?.substringAfter("replace(\"", "")
+                            ?.substringBefore("\")", "")
+                        ?: res.document.selectFirst("script")
+                            ?.data()
+                            ?.substringAfter("replace(\"", "")
+                            ?.substringBefore("\")", "")
+                        ?: ""
+                    if (temp.isBlank()) return null
+                    app.get(
+                        fixUrlWithBase(temp.replace("\\/", "/"), baseUrl),
+                        timeout = 15
+                    ).document
+                } else {
+                    app.get(url, timeout = 15).document
+                }
+            } catch (_: Exception) {
+                null
             }
-        } catch (_: Exception) {
-            return
         }
+        val document = fetchLanding() ?: run {
+            try {
+                Thread.sleep(1000)
+            } catch (_: InterruptedException) {
+            }
+            fetchLanding()
+        } ?: return
 
         val nameText = document.selectFirst(
             "li.list-group-item:contains(Name), ul > li.list-group-item:contains(Name)"
@@ -357,7 +375,10 @@ open class Driveseed : ExtractorApi() {
                 redirected.contains("video-plex") -> "video-plex.xyz"
                 else -> "video-seed.xyz"
             }
-            val postRes = try {
+            // v4: retry the /api unlock POST once — the host sometimes
+            // stalls, and a failed unlock must not silently leave an
+            // unplayable token row when a second try would unlock it.
+            suspend fun unlockPost() = try {
                 app.post(
                     "https://$host/api",
                     headers = mapOf(
@@ -368,8 +389,15 @@ open class Driveseed : ExtractorApi() {
                     data = mapOf("keys" to token)
                 )
             } catch (_: Exception) {
-                return redirected
+                null
             }
+            val postRes = unlockPost() ?: run {
+                try {
+                    Thread.sleep(1000)
+                } catch (_: InterruptedException) {
+                }
+                unlockPost()
+            } ?: return redirected
             val direct = JSONObject(postRes.text).optString("url")
                 .replace("\\/", "/")
             if (direct.isNotBlank()) direct else redirected

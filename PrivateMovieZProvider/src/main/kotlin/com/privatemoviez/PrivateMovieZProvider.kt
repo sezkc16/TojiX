@@ -41,10 +41,22 @@ import org.jsoup.Jsoup
 //   "—–==1080p Lover==—–", "—–==720p Lover==—–") with the download
 //   buttons under it; the heading says "– GoogleDrive", i.e. the files
 //   sit on Google Drive via the HubDrive/HubCloud family.
-// - The text-extraction crawl does NOT surface the buttons' hrefs, so
-//   load() parses defensively: every <a href> in the page PLUS a
-//   raw-HTML regex sweep for the known host URL patterns (covers
-//   JS/data-attribute embedded links too).
+// - v2 fixes (phone-tested v1 bugs, 2026-11-21 02:19):
+//   (a) Posters: the site lazy-loads images — `src` is a data: SVG
+//       placeholder, the real URL is in `data-src`. v1 read `src` first
+//       -> every Home card showed a broken image. v2 reads `data-src`
+//       and strips the -300x450 size suffix (full-size image).
+//   (b) Load: EVERY download button points to pmslink.lol/<token> (the
+//       site's own shortener) — v1 did not know that host, dropped all
+//       links, and load() returned nothing (IllegalStateException).
+//       v2 classifies pmslink links and resolves the token page (302 to
+//       the real host) in loadLinks. NOTE: pmslink sits behind a
+//       Cloudflare managed challenge; it 403s from datacenter IPs, and
+//       the phone test decides whether a residential/mobile IP passes.
+//   (c) Description: the Storyline <p> lives in the sibling
+//       .note-content div, not next to the <h3> — v1's sibling walk
+//       found nothing. v2 reads .note-wrap > .note-content p; no
+//       synopsis -> empty description (never fabricated).
 class PrivateMovieZProvider : MainAPI() {
 
     override var mainUrl = "https://b.privatemoviez.surf"
@@ -65,7 +77,17 @@ class PrivateMovieZProvider : MainAPI() {
     // "gm" = greenmotors.club URL, "gdflix" = gdflix file id,
     // "gdrive" = direct drive.google.com file URL,
     // "archive" = mdrive.lol/archive/<id> page (fetch it in loadLinks
-    // to find its HubCloud/GDFlix buttons).
+    // to find its HubCloud/GDFlix buttons),
+    // "pmslink" = pmslink.lol/<token> — the site's own shortener
+    // (verified live 2026-11-21: EVERY download button on every post
+    // points here, e.g. https://pmslink.lol/b23fea8764/ for Scream 7
+    // 2160p; v1 did not know this host, so every link was dropped and
+    // load() returned nothing). The token page 302-redirects to the real
+    // host (HubDrive/HubCloud/GreenMotors/...); resolve it in loadLinks.
+    // NOTE: pmslink sits behind a Cloudflare managed challenge — from a
+    // datacenter IP it 403s. Phones on residential/mobile IPs usually
+    // get the redirect directly; if the challenge fires, the entry is
+    // skipped (no crash).
     data class LinkEntry(
         @JsonProperty("label") val label: String,
         @JsonProperty("host") val host: String,
@@ -125,6 +147,19 @@ class PrivateMovieZProvider : MainAPI() {
         return cleanText(t)
     }
 
+    // Poster URL from a lazy-loaded <img>: the site's images are
+    // lazy-loaded, so `src` is a data: SVG placeholder and the real URL
+    // lives in `data-src` (v1 used `src` first -> every poster was the
+    // placeholder -> broken-image cards on Home). Strip the WP size
+    // suffix (-300x450) so the full-size image is used.
+    private fun posterUrl(img: org.jsoup.nodes.Element?): String? {
+        val raw = img?.attr("data-src")?.takeIf { it.isNotEmpty() }
+            ?: img?.attr("src")?.takeIf { it.isNotEmpty() && !it.startsWith("data:") }
+            ?: return null
+        val full = raw.replace(Regex("-\\d+x\\d+(?=\\.[A-Za-z]{3,4}(?:\\?|$))"), "")
+        return full.takeIf { it.startsWith("http") }
+    }
+
     // Parse a listing page (home / category / search) into search responses.
     // Post cards link to /<slug>-download.../ with a TMDB poster <img>
     // and the title text inside the anchor (or in a sibling heading).
@@ -146,8 +181,7 @@ class PrivateMovieZProvider : MainAPI() {
             if (title.isEmpty()) continue
             val img = a.selectFirst("img")
                 ?: a.parent()?.selectFirst("img")
-            val poster = img?.attr("src")?.takeIf { it.isNotEmpty() }
-                ?: img?.attr("data-src")?.takeIf { it.isNotEmpty() }
+            val poster = posterUrl(img)
             val display = displayTitle(title)
             if (display.isEmpty()) continue
             val isSeries = display.contains("Season", true)
@@ -195,26 +229,26 @@ class PrivateMovieZProvider : MainAPI() {
         return parseListing(html).toNewSearchResponseList()
     }
 
-    // The plot: the "Storyline" section. The heading is an <h3> with
-    // "Storyline:" and the synopsis sits in the following element.
+    // The plot: the "Storyline" section. The heading is
+    // <h3 class="gb-heading">Storyline:</h3> inside .note-header, and the
+    // synopsis <p> lives in the SIBLING .note-content div inside the same
+    // .note-wrap — v1 walked nextElementSibling() off the <h3> and found
+    // nothing, so the detail page showed "No description available".
+    // If a post has no Storyline section, return null (empty description
+    // — never fabricate, and never use the og:description download blurb).
     private fun parsePlot(doc: org.jsoup.nodes.Document): String? {
         val h = doc.select("h3:contains(Storyline)").firstOrNull()
         if (h != null) {
-            var sib = h.nextElementSibling()
-            var hops = 0
-            while (sib != null && hops < 6) {
-                val text = cleanText(sib.text())
-                if (text.length >= 40) return text
-                sib = sib.nextElementSibling()
-                hops++
-            }
-            // The heading's parent may hold the text instead.
-            val parentText = cleanText(h.parent()?.text() ?: "")
-                .replace(Regex("(?i)^.*?storyline:\\s*"), "")
-            if (parentText.length >= 40) return parentText
+            val wrap = h.parents().firstOrNull { it.hasClass("note-wrap") }
+            val p = wrap?.selectFirst(".note-content p")?.text()?.let { cleanText(it) }
+            if (!p.isNullOrEmpty() && p.length >= 20) return p
         }
-        return doc.selectFirst("meta[property=og:description]")?.attr("content")
-            ?.let { cleanText(it) }?.takeIf { it.length >= 40 }
+        // Regex fallback on the raw HTML (same structure).
+        val m = Regex("(?is)Storyline:</h3>.*?<p[^>]*>(.*?)</p>")
+            .find(doc.html())
+        val text = m?.groupValues?.getOrNull(1)?.let { cleanText(Jsoup.parse(it).text()) }
+        if (!text.isNullOrEmpty() && text.length >= 20) return text
+        return null
     }
 
     // Quality of the "Lover" section a position in the raw HTML sits in:
@@ -265,6 +299,9 @@ class PrivateMovieZProvider : MainAPI() {
             href.contains("mdrive.lol/archive/") -> {
                 LinkEntry(cleanLabel, "archive", href, q)
             }
+            href.contains("pmslink.lol/") -> {
+                LinkEntry(cleanLabel, "pmslink", href, q)
+            }
             else -> null
         }
     }
@@ -305,6 +342,7 @@ class PrivateMovieZProvider : MainAPI() {
             Regex("https?://only-apis\\.com/file/([A-Za-z0-9]+)") to "gdflix",
             Regex("https?://drive\\.google\\.com/file/d/([A-Za-z0-9_-]+)") to "gdrive",
             Regex("https?://mdrive\\.lol/archive/(\\d+)/?") to "archive",
+            Regex("https?://pmslink\\.lol/[A-Za-z0-9]+/?") to "pmslink",
         )
         for ((re, host) in patterns) {
             for (m in re.findAll(html)) {
@@ -314,6 +352,7 @@ class PrivateMovieZProvider : MainAPI() {
                     "gm" -> LinkEntry(q.ifEmpty { "Download" }, "gm", raw, qualityValue(q))
                     "gdrive" -> LinkEntry(q.ifEmpty { "Download" }, "gdrive", raw, qualityValue(q))
                     "archive" -> LinkEntry(q.ifEmpty { "Download" }, "archive", raw, qualityValue(q))
+                    "pmslink" -> LinkEntry(q.ifEmpty { "Download" }, "pmslink", raw, qualityValue(q))
                     else -> classifyLink(raw, q, q)
                 }
                 add(entry)
@@ -328,8 +367,9 @@ class PrivateMovieZProvider : MainAPI() {
         val rawTitle = doc.selectFirst("title")?.text()?.trim() ?: ""
         val title = displayTitle(rawTitle)
         if (title.isEmpty()) return null
-        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-            ?: doc.select("img[src*=wp-content/uploads]").firstOrNull()?.attr("src")
+        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")?.takeIf { it.startsWith("http") }
+            ?: posterUrl(doc.select("img[data-src*=wp-content/uploads]").firstOrNull())
+            ?: posterUrl(doc.select("img[src*=wp-content/uploads]").firstOrNull())
         val plot = parsePlot(doc)
         val isSeries = title.contains("Season", true)
             || Regex("(?i)\\bS\\d{2}\\b").containsMatchIn(title)
@@ -709,6 +749,115 @@ class PrivateMovieZProvider : MainAPI() {
         return true
     }
 
+    // pmslink.lol/<token> -> the real host URL. The token page
+    // 302-redirects to the real host (HubDrive / HubCloud / GreenMotors /
+    // ...). Returns the final URL after redirects, or a HubCloud drive URL
+    // when a code is embedded in the page. Returns null when the
+    // Cloudflare managed challenge is served instead of the redirect
+    // (datacenter IPs get challenged; phones on residential / mobile IPs
+    // usually get the redirect directly).
+    private suspend fun resolvePmsLinkTarget(tokenUrl: String): String? {
+        val resp = try {
+            app.get(tokenUrl, headers = browserHeaders)
+        } catch (e: Exception) { return null }
+        if (resp.code == 403) return null
+        val finalUrl = try {
+            resp.okhttpResponse.request.url.toString()
+        } catch (e: Exception) { "" }
+        if (finalUrl.isNotEmpty() && !finalUrl.contains("pmslink.lol")) return finalUrl
+        val code = hubCloudCode(resp.text)
+        if (code != null) return "https://hubcloud.ist/drive/$code"
+        return null
+    }
+
+    // Emit links for an already-resolved target URL (a pmslink landing,
+    // or a greenmotors target). Mirrors the dispatch in resolveGmEntry.
+    private suspend fun emitTarget(
+        label: String,
+        quality: Int,
+        target: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        var found = false
+        hubCloudCode(target)?.let {
+            if (emitHubCloudServers(label, quality, resolveHubCloudServers(it), callback)) found = true
+            return found
+        }
+        when {
+            target.contains("hubdrive.blog/file/") -> {
+                val id = target.substringAfter("hubdrive.blog/file/").substringBefore("/").substringBefore("?").trim()
+                if (id.isNotEmpty() && emitHubCloudServers(label, quality, resolveHubDrive(id), callback)) found = true
+            }
+            target.contains("hubcdn.club/file/") -> {
+                val id = target.substringAfter("hubcdn.club/file/").substringBefore("/").substringBefore("?").trim()
+                val direct = if (id.isEmpty()) null else resolveHubCdn(id)
+                if (direct != null) {
+                    callback(
+                        newExtractorLink(
+                            source = "HubCdn",
+                            name = "HubCdn $label",
+                            url = direct,
+                            type = ExtractorLinkType.VIDEO
+                        ) {
+                            this.quality = quality
+                            this.referer = "https://hubcdn.club/"
+                        }
+                    )
+                    found = true
+                }
+            }
+            target.contains("greenmotors.club") -> {
+                if (emitHubCloudServers(label, quality, resolveGmEntry(target), callback)) found = true
+            }
+            target.contains("hblinks.lol/") -> {
+                val html = try { app.get(target, headers = browserHeaders).text } catch (e: Exception) { "" }
+                val code = hubCloudCode(html)
+                if (code != null) {
+                    if (emitHubCloudServers(label, quality, resolveHubCloudServers(code), callback)) found = true
+                } else {
+                    val fid = Regex("hubdrive\\.blog/file/(\\d+)").find(html)?.groupValues?.getOrNull(1)
+                    if (fid != null && emitHubCloudServers(label, quality, resolveHubDrive(fid), callback)) found = true
+                }
+            }
+            target.contains("gdflix.") || target.contains("only-apis.com/file/") -> {
+                val id = target.substringAfter("/file/").substringBefore("/").substringBefore("?").trim()
+                if (id.isNotEmpty() && loadExtractor("https://gdflix.vip/file/$id", subtitleCallback, callback)) found = true
+            }
+            target.contains("drive.google.com/file/d/") -> {
+                if (loadExtractor(target, subtitleCallback, callback)) found = true
+            }
+            target.contains("mdrive.lol/archive/") -> {
+                for (sub in fetchArchiveLinks(target)) {
+                    when (sub.host) {
+                        "hubcloud" -> {
+                            val servers = resolveHubCloudServers(sub.id)
+                            if (emitHubCloudServers(label, quality, servers, callback)) found = true
+                        }
+                        "gdflix" -> {
+                            if (loadExtractor("https://gdflix.vip/file/${sub.id}", subtitleCallback, callback)) found = true
+                        }
+                    }
+                }
+            }
+            target.startsWith("http") -> {
+                callback(
+                    newExtractorLink(
+                        source = "HubCloud",
+                        name = "HubCloud $label",
+                        url = target,
+                        type = ExtractorLinkType.VIDEO
+                    ) {
+                        this.quality = quality
+                        this.referer = "https://hubcloud.pw/"
+                    }
+                )
+                found = true
+            }
+        }
+        return found
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -727,6 +876,7 @@ class PrivateMovieZProvider : MainAPI() {
             val hubCdn: String?,
             val servers: List<HubServer>,
             val subs: List<LinkEntry>,
+            val target: String? = null,
         )
 
         val resolved: List<ResolvedEntry> = entries.amap { entry ->
@@ -736,6 +886,7 @@ class PrivateMovieZProvider : MainAPI() {
                 "gm" -> ResolvedEntry(null, resolveGmEntry(entry.id), emptyList())
                 "hubcloud" -> ResolvedEntry(null, resolveHubCloudServers(entry.id), emptyList())
                 "archive" -> ResolvedEntry(null, emptyList(), fetchArchiveLinks(entry.id))
+                "pmslink" -> ResolvedEntry(null, emptyList(), emptyList(), resolvePmsLinkTarget(entry.id))
                 else -> ResolvedEntry(null, emptyList(), emptyList())
             }
         }
@@ -780,6 +931,10 @@ class PrivateMovieZProvider : MainAPI() {
                     // Direct Google Drive file: CloudStream's built-in
                     // GDrive extractor handles it.
                     if (loadExtractor(entry.id, subtitleCallback, callback)) found = true
+                }
+                "pmslink" -> {
+                    val target = res.target ?: return@forEach
+                    if (emitTarget(entry.label, entry.quality, target, subtitleCallback, callback)) found = true
                 }
             }
         }

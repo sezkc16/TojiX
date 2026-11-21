@@ -249,6 +249,19 @@ class MoviesModProvider : MainAPI() {
         val year = Regex("(?<=\\()[\\d(\\]]+(?!=\\))")
             .find(rawTitle)?.value?.toIntOrNull()
         val tags = doc.select("div.thecategory a").eachText()
+        // Recommendations: the "Related Posts" block (div.related-posts)
+        // uses the identical article.latestPost.excerpt card markup as
+        // the listings, so the existing toSearchResult() parser reuses
+        // directly — apiName = MoviesMod and each url is load()-able,
+        // which the app requires to keep a recommendation. Verified
+        // live on movie AND series pages (4 cards each). The site
+        // publishes NO cast block anywhere on a post page (no
+        // "Star Cast" / "Stars:" / "Starring"), so actors stays unset.
+        val recommendations = doc.select("div.related-posts article.latestPost.excerpt")
+            .mapNotNull { toSearchResult(it) }
+            .filter { it.url != url }
+            .distinctBy { it.url }
+            .take(20)
         val contentEl = doc.selectFirst("div.entry-content")
         val hasEpisodeButtons = contentEl
             ?.select("a.maxbutton-episode-links")
@@ -271,7 +284,8 @@ class MoviesModProvider : MainAPI() {
         if (!isSeries) {
             return movieResponse(
                 doc, title, url, poster, collectionPoster, logo,
-                year, tags, background, description, imdbRating
+                year, tags, background, description, imdbRating,
+                recommendations
             )
         }
 
@@ -344,7 +358,8 @@ class MoviesModProvider : MainAPI() {
             ) {
                 applyMeta(
                     poster, collectionPoster, logo, year, tags,
-                    background, description, imdbRating
+                    background, description, imdbRating,
+                    recommendations
                 )
             }
         }
@@ -366,13 +381,15 @@ class MoviesModProvider : MainAPI() {
             ) {
                 applyMeta(
                     poster, collectionPoster, logo, year, tags,
-                    background, description, imdbRating
+                    background, description, imdbRating,
+                    recommendations
                 )
             }
         }
         return movieResponse(
             doc, title, url, poster, collectionPoster, logo,
-            year, tags, background, description, imdbRating
+            year, tags, background, description, imdbRating,
+            recommendations
         )
     }
 
@@ -447,7 +464,8 @@ class MoviesModProvider : MainAPI() {
         tags: List<String>,
         background: String?,
         description: String?,
-        imdbRating: String?
+        imdbRating: String?,
+        recommendations: List<SearchResponse>? = null
     ): LoadResponse {
         val scope = doc.selectFirst("div.entry-content") ?: doc
         val data = scope.select("a.maxbutton-download-links")
@@ -472,7 +490,8 @@ class MoviesModProvider : MainAPI() {
         return newMovieLoadResponse(title, url, TvType.Movie, data) {
             applyMeta(
                 poster, collectionPoster, logo, year, tags,
-                background, description, imdbRating
+                background, description, imdbRating,
+                recommendations
             )
         }
     }
@@ -491,7 +510,8 @@ class MoviesModProvider : MainAPI() {
         tags: List<String>,
         background: String?,
         description: String?,
-        imdbRating: String?
+        imdbRating: String?,
+        recommendations: List<SearchResponse>? = null
     ) {
         this.posterUrl = poster?.takeIf { it.isNotBlank() }
             ?: collectionPoster?.takeIf { it.isNotBlank() }
@@ -505,6 +525,9 @@ class MoviesModProvider : MainAPI() {
             ?: collectionPoster?.takeIf { it.isNotBlank() }
         this.plot = description
         imdbRating?.toDoubleOrNull()?.let { this.score = Score.from10(it) }
+        // "Related Posts" from the post page; null when the block is
+        // absent so the app hides the More Like This row.
+        this.recommendations = recommendations?.takeIf { it.isNotEmpty() }
     }
 
     override suspend fun loadLinks(

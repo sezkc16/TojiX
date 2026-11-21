@@ -1,5 +1,5 @@
 // Use an integer for version numbers
-version = 4
+version = 5
 
 cloudstream {
     description = "MoviesMod | Movies Mod 2025, MoviesMod Official"

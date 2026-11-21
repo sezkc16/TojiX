@@ -2,6 +2,8 @@ package com.fourkhdhub
 
 import java.util.Base64 as JavaBase64
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.lagradost.cloudstream3.Actor
+import com.lagradost.cloudstream3.ActorData
 import com.lagradost.cloudstream3.Episode
 import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.HomePageResponse
@@ -29,6 +31,8 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 
 class FourKHDHubProvider : MainAPI() {
 
@@ -89,6 +93,32 @@ class FourKHDHubProvider : MainAPI() {
         return raw.replace(Regex("\\s+"), " ").trim()
     }
 
+    // Parse one listing card (<a class="movie-card">) into a search response.
+    // Used by parseListing() AND by load() for the "You May Also Like"
+    // related grid, which uses the identical card markup — so a related
+    // item is load()-able by this provider and its apiName is this
+    // provider's name (new*SearchResponse sets apiName = this.name),
+    // which the app requires to keep a recommendation.
+    private fun parseCard(a: Element): com.lagradost.cloudstream3.SearchResponse? {
+        val href = a.attr("href")
+        val url = if (href.startsWith("http")) href else mainUrl + href
+        val img = a.selectFirst("img")
+        val poster = img?.attr("src")?.takeIf { it.isNotEmpty() }
+            ?: img?.attr("data-src")?.takeIf { it.isNotEmpty() }
+        var title = a.attr("aria-label").replace(Regex(" details$"), "").trim()
+        if (title.isEmpty()) title = img?.attr("alt")?.trim() ?: ""
+        if (title.isEmpty()) title = cleanTitle(a.text())
+        if (title.isEmpty()) return null
+        // Strip a trailing " (2026)" year for display; year is not stored here
+        val display = title.replace(Regex("\\s*\\(\\d{4}\\)\\s*$"), "").trim()
+        val isSeries = href.contains("-series-") || title.contains("Season", true)
+        return if (isSeries) {
+            newTvSeriesSearchResponse(display, url, TvType.TvSeries) { this.posterUrl = poster }
+        } else {
+            newMovieSearchResponse(display, url, TvType.Movie) { this.posterUrl = poster }
+        }
+    }
+
     // Parse a listing page (home / category / search) into search responses.
     // Cards are <a href="/<slug>-movie-<id>/" class="movie-card"> with a TMDB
     // poster <img> and the title in aria-label / img alt.
@@ -97,26 +127,43 @@ class FourKHDHubProvider : MainAPI() {
         val out = mutableListOf<com.lagradost.cloudstream3.SearchResponse>()
         val seen = mutableSetOf<String>()
         for (a in doc.select("a.movie-card[href]")) {
-            val href = a.attr("href")
-            val url = if (href.startsWith("http")) href else mainUrl + href
-            if (!seen.add(url)) continue
-            val img = a.selectFirst("img")
-            val poster = img?.attr("src")?.takeIf { it.isNotEmpty() }
-                ?: img?.attr("data-src")?.takeIf { it.isNotEmpty() }
-            var title = a.attr("aria-label").replace(Regex(" details$"), "").trim()
-            if (title.isEmpty()) title = img?.attr("alt")?.trim() ?: ""
-            if (title.isEmpty()) title = cleanTitle(a.text())
-            if (title.isEmpty()) continue
-            // Strip a trailing " (2026)" year for display; year is not stored here
-            val display = title.replace(Regex("\\s*\\(\\d{4}\\)\\s*$"), "").trim()
-            val isSeries = href.contains("-series-") || title.contains("Season", true)
-            if (isSeries) {
-                out.add(newTvSeriesSearchResponse(display, url, TvType.TvSeries) { this.posterUrl = poster })
-            } else {
-                out.add(newMovieSearchResponse(display, url, TvType.Movie) { this.posterUrl = poster })
-            }
+            val card = parseCard(a) ?: continue
+            if (!seen.add(card.url)) continue
+            out.add(card)
         }
         return out
+    }
+
+    // Cast from the "Stars:" metadata row, e.g.
+    // "Tom Hardy (Harry Da Souza), Pierce Brosnan (Conrad Harrigan), ..."
+    // (verified live on movie AND series pages). The site lists no actor
+    // images, so image stays null; the character name goes to roleString,
+    // which the app shows as the role. Returns at most 10 actors.
+    private fun parseStars(doc: Document): List<ActorData> {
+        val item = doc.select("div.metadata-item").firstOrNull {
+            it.selectFirst("span.metadata-label")?.text()?.trim() == "Stars:"
+        } ?: return emptyList()
+        val value = item.selectFirst("span.metadata-value")?.text()?.trim().orEmpty()
+        if (value.isEmpty()) return emptyList()
+        val out = mutableListOf<ActorData>()
+        // Character names on this site contain no commas or parens, so
+        // "Name (Character)" pairs can be matched with one regex.
+        val pairRe = Regex("([^,()]+?)\\s*\\(([^()]+)\\)")
+        for (m in pairRe.findAll(value)) {
+            val actorName = m.groupValues[1].trim()
+            val role = m.groupValues[2].trim()
+            if (actorName.isNotEmpty()) {
+                out.add(ActorData(Actor(actorName), roleString = role.ifEmpty { null }))
+            }
+        }
+        if (out.isEmpty()) {
+            // Fallback: no "(Role)" parts — plain comma-separated names.
+            for (part in value.split(",")) {
+                val actorName = part.trim()
+                if (actorName.isNotEmpty()) out.add(ActorData(Actor(actorName)))
+            }
+        }
+        return out.take(10)
     }
 
     override val mainPage = mainPageOf(
@@ -170,6 +217,14 @@ class FourKHDHubProvider : MainAPI() {
         val tags = doc.select("span.badge").map { cleanTitle(it.text()) }
             .filter { it.isNotEmpty() }.distinct().take(8)
         val isSeries = url.contains("-series-")
+        // Cast + related: the "Stars:" metadata row and the
+        // "You May Also Like" grid (div.card-grid-small, same card markup
+        // as listings). Both verified live on movie AND series pages.
+        // These are what the app renders as Cast and More Like This.
+        val actors = parseStars(doc)
+        val recommendations = doc.select("div.card-grid-small a.movie-card")
+            .mapNotNull { parseCard(it) }
+            .filter { it.url != url }
 
         if (isSeries) {
             val episodes = mutableListOf<Episode>()
@@ -263,6 +318,8 @@ class FourKHDHubProvider : MainAPI() {
                 this.plot = plot
                 this.year = year
                 this.tags = tags
+                this.actors = actors.takeIf { it.isNotEmpty() }
+                this.recommendations = recommendations.takeIf { it.isNotEmpty() }
             }
         } else {
             // Movie: one link entry per quality download-item (label keeps
@@ -295,6 +352,8 @@ class FourKHDHubProvider : MainAPI() {
                 this.plot = plot
                 this.year = year
                 this.tags = tags
+                this.actors = actors.takeIf { it.isNotEmpty() }
+                this.recommendations = recommendations.takeIf { it.isNotEmpty() }
             }
         }
     }

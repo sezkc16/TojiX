@@ -525,17 +525,12 @@ class WatchAnimeWorldProvider : MainAPI() {
         return current
     }
 
-    // Resolve a short.icu link to its final host. The manual chain above
-    // handles a plain 3xx; if the shortener answers without one (or the
-    // chain cannot be followed from this client), fall back to letting
-    // OkHttp follow the redirects and read the final request URL.
+    // Resolve a short.icu link to its final host via the manual
+    // redirect chain. If the shortener answers without a 3xx from this
+    // client, the link is returned unchanged and the caller falls back
+    // to the stock extractor (which matches nothing for short.icu).
     private suspend fun resolveShortLink(url: String, referer: String): String {
-        val manual = resolveRedirects(url, referer)
-        if (manual != url) return manual
-        return try {
-            val res = app.get(url, headers = browserHeaders + ("Referer" to referer))
-            res.request.url.toString()
-        } catch (e: Exception) { url }
+        return resolveRedirects(url, referer)
     }
 
     private fun directMediaUrl(url: String): String? {

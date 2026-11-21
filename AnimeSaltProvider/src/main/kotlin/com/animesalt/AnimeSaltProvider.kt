@@ -107,8 +107,6 @@ class AnimeSaltProvider : MainAPI() {
     // <img data-src="//image.tmdb.org/t/p/w500/..."> and the detail
     // link <a class="lnk-blk" href="/series/<slug>/">. The article
     // class ("movies"/"series") is unreliable — the URL decides type.
-    // Home (/) is JS-rendered templates, so the main page uses the
-    // server-rendered /series/ and /movies/ archives instead.
     private fun parseListing(html: String): List<com.lagradost.cloudstream3.SearchResponse> {
         val doc = Jsoup.parse(html)
         val out = mutableListOf<com.lagradost.cloudstream3.SearchResponse>()
@@ -137,17 +135,153 @@ class AnimeSaltProvider : MainAPI() {
         return out
     }
 
+    // ---- homepage (v3) ----
+    //
+    // The REAL homepage https://animesalt.cx/ is server-rendered
+    // (the v1 claim that it is JS-rendered was wrong — the sections
+    // are in the HTML). Verified live 2026-11-22. Its sections, in
+    // order, are headed by <h3 class="section-title">:
+    //   "Most-Watched Series" / "Most-Watched Films" — a ranked chart:
+    //     <div class="chart-item"> with <a class="chart-poster"
+    //     href="/series/<slug>/"> + <img data-src="..."> +
+    //     <div class="chart-title">Title</div> (24 series, 25 films).
+    //   "Fresh Drops" — latest-episode swiper: <div class="swiper-slide
+    //     latest-ep-swiper-slide"> > <article class="post"> with
+    //     <h2 class="entry-title">, <img data-src>, <a class="lnk-blk">
+    //     to the series page (19 items).
+    //   "On-Air Series" / "New Anime Arrivals" / "Just In: Cartoon
+    //   Series" / "Latest Anime Movies" / "Fresh Cartoon Films" — a
+    //   swiper: <div class="swiper-slide
+    //   latest-movies-series-swiper-slide"> > <article class="post">
+    //   with <img data-src> and <a class="lnk-blk">; the article has
+    //   NO title element, so the title comes from the img alt
+    //   "Image <title>" (13–19 items each).
+    // "Watch History" (user-specific template) and "Navigate A to Z"
+    // (letters) carry no content and are skipped.
+    // The homepage is fetched once and cached for 10 minutes, because
+    // getMainPage is called once per row.
+    private var homeCacheAt = 0L
+    private var homeCache: Map<String, List<com.lagradost.cloudstream3.SearchResponse>>? = null
+
+    private fun homeItem(url: String, title: String, poster: String?): com.lagradost.cloudstream3.SearchResponse {
+        return if (url.contains("/movies/")) {
+            newMovieSearchResponse(title, url, TvType.Movie) { this.posterUrl = poster }
+        } else {
+            newTvSeriesSearchResponse(title, url, TvType.TvSeries) { this.posterUrl = poster }
+        }
+    }
+
+    private fun homePoster(article: Element): String? {
+        val img = article.selectFirst("img[data-src]") ?: article.selectFirst("img[src]")
+        val raw = img?.attr("data-src")?.takeIf { it.isNotEmpty() && !it.startsWith("data:") }
+            ?: img?.attr("src")?.takeIf { it.isNotEmpty() && !it.startsWith("data:") }
+        return raw?.let { fixUrl(it) }
+    }
+
+    private fun parseHomeSections(doc: Document): Map<String, List<com.lagradost.cloudstream3.SearchResponse>> {
+        val sections = linkedMapOf<String, MutableList<com.lagradost.cloudstream3.SearchResponse>>()
+        var currentTitle: String? = null
+        // Document order: each chart item / swiper slide belongs to
+        // the nearest preceding h3.section-title, whatever its nesting.
+        for (el in doc.select("h3.section-title, div.chart-item, div.swiper-slide")) {
+            when {
+                el.tagName() == "h3" -> {
+                    currentTitle = el.text().replace("View More »", "").replace("View More", "").trim()
+                    if (currentTitle.isEmpty() || currentTitle == "Watch History" || currentTitle == "Navigate A to Z") {
+                        currentTitle = null
+                    }
+                }
+                currentTitle == null -> Unit
+                el.hasClass("chart-item") -> {
+                    val link = el.selectFirst("a.chart-poster") ?: continue
+                    val href = link.attr("href")
+                    if (href.isEmpty()) continue
+                    val title = cleanTitle(el.selectFirst("div.chart-title")?.text().orEmpty())
+                    if (title.isEmpty()) continue
+                    val list = sections.getOrPut(currentTitle) { mutableListOf() }
+                    if (list.none { it.url == fixUrl(href) }) {
+                        list.add(homeItem(fixUrl(href), title, homePoster(el)))
+                    }
+                }
+                el.hasClass("swiper-slide") -> {
+                    val article = el.selectFirst("article.post") ?: continue
+                    val link = article.selectFirst("a.lnk-blk[href]") ?: continue
+                    val href = link.attr("href")
+                    if (href.isEmpty()) continue
+                    val title = cleanTitle(article.selectFirst("h2.entry-title")?.text().orEmpty())
+                        .takeIf { it.isNotEmpty() }
+                        ?: cleanTitle(article.selectFirst("img")?.attr("alt").orEmpty().removePrefix("Image "))
+                            .takeIf { it.isNotEmpty() }
+                        ?: continue
+                    val list = sections.getOrPut(currentTitle) { mutableListOf() }
+                    if (list.none { it.url == fixUrl(href) }) {
+                        list.add(homeItem(fixUrl(href), title, homePoster(article)))
+                    }
+                }
+            }
+        }
+        return sections.filterValues { it.isNotEmpty() }
+    }
+
+    private suspend fun fetchHomeSections(): Map<String, List<com.lagradost.cloudstream3.SearchResponse>> {
+        val now = System.currentTimeMillis()
+        homeCache?.let { if (now - homeCacheAt < 10 * 60 * 1000) return it }
+        val sections = try {
+            val doc = Jsoup.parse(app.get(mainUrl, headers = browserHeaders).text)
+            parseHomeSections(doc)
+        } catch (e: Exception) { emptyMap() }
+        homeCache = sections
+        homeCacheAt = now
+        return sections
+    }
+
+    // Homepage section key -> the site's section title, and the archive
+    // to fall back on if that section cannot be parsed.
+    private val homeSections = mapOf(
+        "home-most-watched-series" to Pair("Most-Watched Series", "series"),
+        "home-most-watched-films" to Pair("Most-Watched Films", "movies"),
+        "home-fresh-drops" to Pair("Fresh Drops", "series"),
+        "home-on-air-series" to Pair("On-Air Series", "series"),
+        "home-new-anime-arrivals" to Pair("New Anime Arrivals", "series"),
+        "home-cartoon-series" to Pair("Just In: Cartoon Series", "series"),
+        "home-latest-anime-movies" to Pair("Latest Anime Movies", "movies"),
+        "home-fresh-cartoon-films" to Pair("Fresh Cartoon Films", "movies"),
+    )
+
+    private suspend fun fetchArchive(cat: String, page: Int): List<com.lagradost.cloudstream3.SearchResponse> {
+        val url = if (page <= 1) "$mainUrl/$cat/" else "$mainUrl/$cat/page/$page/"
+        return try {
+            parseListing(app.get(url, headers = browserHeaders).text)
+        } catch (e: Exception) { emptyList() }
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val cat = request.data
-        val url = if (page <= 1) "$mainUrl/$cat/" else "$mainUrl/$cat/page/$page/"
-        val html = app.get(url, headers = browserHeaders).text
-        val list = parseListing(html)
+        val home = homeSections[cat]
+        if (home != null && page <= 1) {
+            val list = fetchHomeSections()[home.first]
+            if (!list.isNullOrEmpty()) {
+                return newHomePageResponse(HomePageList(request.name, list), hasNext = false)
+            }
+            // Section missing/unparseable: fall back to its archive.
+            val archive = fetchArchive(home.second, 1)
+            return newHomePageResponse(HomePageList(request.name, archive), hasNext = archive.isNotEmpty())
+        }
+        val list = fetchArchive(cat, page)
         return newHomePageResponse(HomePageList(request.name, list), hasNext = list.isNotEmpty())
     }
 
     override val mainPage = mainPageOf(
-        "series" to "Anime Series",
-        "movies" to "Anime Movies",
+        "home-most-watched-series" to "Most-Watched Series",
+        "home-most-watched-films" to "Most-Watched Films",
+        "home-fresh-drops" to "Fresh Drops",
+        "home-on-air-series" to "On-Air Series",
+        "home-new-anime-arrivals" to "New Anime Arrivals",
+        "home-cartoon-series" to "Just In: Cartoon Series",
+        "home-latest-anime-movies" to "Latest Anime Movies",
+        "home-fresh-cartoon-films" to "Fresh Cartoon Films",
+        "series" to "All Anime Series",
+        "movies" to "All Anime Movies",
     )
 
     override suspend fun search(query: String, page: Int): SearchResponseList? {

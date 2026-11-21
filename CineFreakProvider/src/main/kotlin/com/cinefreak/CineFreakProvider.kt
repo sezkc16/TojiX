@@ -359,7 +359,8 @@ class CineFreakProvider : MainAPI() {
     // reveals its Content-Length; a real movie file is orders of
     // magnitude larger. Fail open (accept the URL) when the HEAD fails
     // or carries no length, so a host quirk never blocks a real stream.
-    private fun isRealVideo(url: String): Boolean {
+    // (Suspend: app.head is a suspend function.)
+    private suspend fun isRealVideo(url: String): Boolean {
         return try {
             val len = app.head(url, headers = mapOf("Referer" to "https://cinefreak.net/"))
                 .headers["Content-Length"]?.toLongOrNull()

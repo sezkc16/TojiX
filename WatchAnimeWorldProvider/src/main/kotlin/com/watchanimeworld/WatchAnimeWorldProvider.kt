@@ -27,6 +27,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import okhttp3.FormBody
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -53,6 +54,12 @@ class WatchAnimeWorldProvider : MainAPI() {
     data class LangLink(
         @JsonProperty("language") val language: String? = null,
         @JsonProperty("link") val link: String? = null,
+    )
+
+    // FirePlayer/VPlayer getVideo response: the HLS master playlist URL.
+    data class FirePlayerResponse(
+        @JsonProperty("securedLink") val securedLink: String? = null,
+        @JsonProperty("videoSource") val videoSource: String? = null,
     )
 
     private fun fixUrl(url: String): String {
@@ -349,22 +356,38 @@ class WatchAnimeWorldProvider : MainAPI() {
         ) url else null
     }
 
-    // Best effort: the as-cdn embed is a player page — if it carries a
-    // direct m3u8/mp4 in its HTML, take it. The host drops plain HTTP
-    // from datacenter IPs, so this only fires where it is reachable.
-    private suspend fun scrapeEmbedMedia(embedUrl: String, referer: String): List<String> {
-        val html = try {
-            app.get(embedUrl, headers = browserHeaders + ("Referer" to referer)).text
-        } catch (e: Exception) { return emptyList() }
-        val found = mutableListOf<String>()
-        val mediaRe = Regex("""https?://[^\s"'\\]+?\.(?:m3u8|mp4)(?:[?#][^\s"'\\]*)?""")
-        for (m in mediaRe.findAll(html)) found.add(m.value)
-        val fileRe = Regex(""""file"\s*:\s*"(https?://[^"]+)"""")
-        for (m in fileRe.findAll(html)) {
-            val u = m.groupValues[1]
-            if (u.contains(".m3u8") || u.contains(".mp4")) found.add(u)
-        }
-        return found.distinct()
+    // FirePlayer/VPlayer embed (as-cdn26.top etc.): the embed HTML
+    // NEVER contains the video URL — the player fetches it via:
+    //   POST {origin}/player/index.php?data={hash}&do=getVideo
+    //   body (form): hash={hash}&r={site base URL}
+    //   -> JSON { securedLink | videoSource } = HLS master playlist URL.
+    // Verified against the working Nuvio provider for this exact site
+    // (mayurgj/nama providers/watchanimeworld.js v1.2.1, fpGetMasterUrl).
+    // NOTE: the host is unreachable from this VM (empty reply / no DNS),
+    // so this path is verified by the phone test only.
+    private suspend fun resolveFirePlayer(embedUrl: String): String? {
+        val m = Regex("""//([a-z0-9.-]+)/video/([a-f0-9]{32})""").find(embedUrl) ?: return null
+        val origin = "https://" + m.groupValues[1]
+        val hash = m.groupValues[2]
+        return try {
+            val body = FormBody.Builder()
+                .add("hash", hash)
+                .add("r", "$mainUrl/")
+                .build()
+            val res = app.post(
+                "$origin/player/index.php?data=$hash&do=getVideo",
+                headers = mapOf(
+                    "Content-Type" to "application/x-www-form-urlencoded",
+                    "X-Requested-With" to "XMLHttpRequest",
+                    "Referer" to "$origin/video/$hash",
+                    "Origin" to origin,
+                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
+                requestBody = body
+            )
+            val parsed = tryParseJson<FirePlayerResponse>(res.text)
+            (parsed?.securedLink ?: parsed?.videoSource)?.takeIf { it.isNotBlank() }
+        } catch (e: Exception) { null }
     }
 
     override suspend fun loadLinks(
@@ -380,31 +403,32 @@ class WatchAnimeWorldProvider : MainAPI() {
         val doc = Jsoup.parse(html)
         var found = false
 
-        // ---- Server 1 (default): as-cdn26.top embed ----
+        // ---- Server 1 (default): FirePlayer/VPlayer embed (as-cdn26.top) ----
         // The iframe carries both src and data-src (same URL); read
         // src first, data-src as fallback (some pages lazy-load it).
+        // The master .m3u8 from getVideo is handed to the player as one
+        // stream (the player picks quality); referer is the embed origin.
         val embedUrl = doc.selectFirst("#options-0 iframe[src]")?.attr("src")?.takeIf { it.isNotEmpty() }
             ?: doc.selectFirst("#options-0 iframe[data-src]")?.attr("data-src")?.takeIf { it.isNotEmpty() }
             ?: doc.selectFirst("iframe[src*=as-cdn]")?.attr("src")?.takeIf { it.isNotEmpty() }
             ?: doc.selectFirst("iframe[data-src*=as-cdn]")?.attr("data-src")?.takeIf { it.isNotEmpty() }
         if (!embedUrl.isNullOrEmpty()) {
             val fullEmbed = fixUrl(embedUrl)
-            for (media in scrapeEmbedMedia(fullEmbed, pageUrl)) {
+            val master = resolveFirePlayer(fullEmbed)
+            if (!master.isNullOrEmpty()) {
                 callback(
                     newExtractorLink(
                         source = "WatchAnimeWorld",
                         name = "Server 1",
-                        url = media,
+                        url = master,
                         type = ExtractorLinkType.VIDEO
                     ) {
-                        this.referer = pageUrl
+                        this.referer = fullEmbed.substringBefore("/video/")
                         this.quality = Qualities.Unknown.value
                     }
                 )
                 found = true
             }
-            // Stock extractor for the embed host, if one matches.
-            if (loadExtractor(fullEmbed, subtitleCallback, callback)) found = true
         }
 
         // ---- Server 2 (alt): multi-language player ----

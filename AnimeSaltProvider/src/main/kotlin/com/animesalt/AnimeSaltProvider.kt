@@ -23,9 +23,12 @@ import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import okhttp3.FormBody
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -62,6 +65,24 @@ class AnimeSaltProvider : MainAPI() {
     data class LangLink(
         @JsonProperty("language") val language: String? = null,
         @JsonProperty("link") val link: String? = null,
+    )
+
+    // enc-dec.app dec-abyss response: direct .mp4 URLs per quality.
+    data class AbyssSource(
+        @JsonProperty("url") val url: String? = null,
+        @JsonProperty("size") val size: Long? = null,
+        @JsonProperty("type") val type: String? = null,
+        @JsonProperty("codec") val codec: String? = null,
+        @JsonProperty("status") val status: Boolean? = null,
+    )
+
+    data class AbyssResult(
+        @JsonProperty("sources") val sources: List<AbyssSource>? = null,
+    )
+
+    data class AbyssResponse(
+        @JsonProperty("status") val status: Int? = null,
+        @JsonProperty("result") val result: AbyssResult? = null,
     )
 
     private fun fixUrl(url: String): String {
@@ -292,6 +313,69 @@ class AnimeSaltProvider : MainAPI() {
         } catch (e: Exception) { emptyList() }
     }
 
+    // Server 2 (abyssplayer): the JWPlayer page carries one long base64
+    // blob (JSON with slug, md5_id, user_id and an encrypted "media"
+    // field). The blob is decoded via the enc-dec.app API, which
+    // returns direct .mp4 URLs per quality. This is the exact method
+    // Phisher's WORKING Animesalt v18 uses (his plugin resolves the
+    // episode page's Server 2 abyssplayer links through this decode
+    // API, and v18 plays on the user's phone). Verified live from this
+    // VM: POST https://enc-dec.app/api/dec-abyss with
+    // {"text":"<full blob>"} returns HTTP 200
+    // {"status":200,"result":{"sources":[{"url":"https://<host>.sssrr.org
+    // /sora/<size>/<token>","size":...,"type":"480p"|"720p"|"1080p",
+    // "codec":"h264","status":true}, ...]}}.
+    // Sending just the URL or just the "media" string returns HTTP 500
+    // — the FULL blob is what works. The decoded .mp4 URLs are IP-bound
+    // (they 403 from this VM whose egress proxy rotates IPs), so on the
+    // phone the plugin decodes and the player fetches from the same IP.
+    private suspend fun resolveAbyss(
+        abyssUrl: String,
+        lang: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        return try {
+            val page = app.get(abyssUrl, headers = browserHeaders).text
+            val blob = Regex("""["'][A-Za-z0-9+/=]{200,}["']""")
+                .findAll(page)
+                .map { it.value.trim('"', '\'') }
+                .firstOrNull { candidate ->
+                    try {
+                        val decoded = String(Base64.getDecoder().decode(candidate), Charsets.UTF_8)
+                        decoded.contains("\"media\"")
+                    } catch (e: Exception) { false }
+                } ?: return false
+            val requestBody = """{"text":"$blob"}""".toRequestBody("application/json".toMediaTypeOrNull())
+            val res = app.post(
+                "https://enc-dec.app/api/dec-abyss",
+                headers = mapOf(
+                    "Content-Type" to "application/json",
+                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
+                requestBody = requestBody
+            )
+            val parsed = tryParseJson<AbyssResponse>(res.text) ?: return false
+            var emitted = false
+            for (source in parsed.result?.sources.orEmpty()) {
+                val url = source.url?.takeIf { it.isNotBlank() } ?: continue
+                val label = source.type?.takeIf { it.isNotBlank() } ?: "Unknown"
+                callback(
+                    newExtractorLink(
+                        source = "AnimeSalt",
+                        name = "Server 2 $lang $label",
+                        url = url,
+                        type = ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = abyssUrl
+                        this.quality = getQualityFromName(label)
+                    }
+                )
+                emitted = true
+            }
+            emitted
+        } catch (e: Exception) { false }
+    }
+
     private fun directMediaUrl(url: String): String? {
         val path = url.substringBefore("#").substringBefore("?")
         return if (path.endsWith(".m3u8", true) || path.endsWith(".mp4", true) ||
@@ -343,8 +427,10 @@ class AnimeSaltProvider : MainAPI() {
         // ---- Server 2 (alt): self-hosted multi-language Plyr player ----
         // iframe data-src="/wp-content/themes/torofilm/public/plyr/player.php
         // ?data=<b64 JSON>" — the JSON maps each audio language to a
-        // player.abyssplayer.com link. Some pages only have Server 1,
-        // so this block is optional.
+        // player.abyssplayer.com link. Each abyssplayer link is resolved
+        // through the enc-dec.app dec-abyss API into direct .mp4 URLs
+        // per quality (the method Phisher's working Animesalt v18 uses).
+        // Some pages only have Server 1, so this block is optional.
         val playerData = doc.selectFirst("#options-1 iframe[data-src]")?.attr("data-src")?.takeIf { it.isNotEmpty() }
             ?: doc.selectFirst("iframe[data-src*=player.php]")?.attr("data-src")?.takeIf { it.isNotEmpty() }
             ?: doc.selectFirst("iframe[src*=player.php]")?.attr("src")?.takeIf { it.isNotEmpty() }
@@ -370,6 +456,8 @@ class AnimeSaltProvider : MainAPI() {
                     }
                 )
                 found = true
+            } else if (link.contains("abyssplayer.com")) {
+                if (resolveAbyss(link, lang, callback)) found = true
             } else if (loadExtractor(link, subtitleCallback, callback)) {
                 found = true
             }

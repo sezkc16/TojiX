@@ -24,8 +24,10 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import org.jsoup.Jsoup
+import java.util.concurrent.atomic.AtomicReference
 
 class CineFreakProvider : MainAPI() {
 
@@ -314,18 +316,90 @@ class CineFreakProvider : MainAPI() {
         return tok
     }
 
-    // CineCloud's Turnstile check is INTERMITTENT (found 2026-11-10):
-    // most of the time /unlock and a=play accept an EMPTY token, but
-    // during enforcement windows they reject it (403 "Verification
-    // failed" / 401 "need ts") and NO provider can obtain a real
-    // Turnstile token — only a browser can. So loadLinks below runs in
-    // two passes: a fast first pass, and — only if it finds NOTHING —
-    // a delayed second pass, so a short enforcement blip does not
-    // zero out the whole list. A sustained enforcement window still
-    // cannot be beaten (same as Kartoons.to).
-    // Also: some download tokens go stale (410 "link has expired")
-    // while their sibling watch token still works, so watch is tried
-    // before download for the same quality.
+    // ---- CineCloud Turnstile solver (v6) ----
+    // The CineCloud player page requires a Cloudflare Turnstile token
+    // (needTs = true) to return the real video URL. Without a valid `ts`,
+    // BOTH the watch flow (POST a=play) and the download flow (307)
+    // return a 60-second "This video does not play in this app"
+    // placeholder mp4 (271,708 bytes) instead of the movie — the server
+    // answers HTTP 200 either way, so a plain HTTP client cannot tell
+    // it failed. Only a real browser can produce a valid `ts`.
+    // So the watch token is resolved through CloudStream's
+    // WebViewResolver: the engine loads the player page in the app's
+    // own browser (WKWebView on iOS, System WebView on Android), the
+    // page's own JS solves Turnstile there (the app shows the checkbox
+    // to the user in its check sheet if a click is needed), and the
+    // resolver hands back the real video URL the page requests. Time
+    // spent waiting on the app's browser does not count against the
+    // loadLinks timeout, so the user has as long as they need to tick
+    // the checkbox. The plain flows below stay as fallbacks for when
+    // enforcement is off; a HEAD guard (isRealVideo) stops the
+    // placeholder from ever being emitted as a stream.
+
+    // What the resolver runs in the player page after each request (and
+    // polled every 2 s): the video URL once the page's own play() has
+    // set it (cfPlayer iframe src, or cfVlc anchor href), SHOW_SHEET
+    // while the Turnstile widget waits for a person (the app then shows
+    // the page so the person can tick the checkbox), or '' while it is
+    // still loading. The engine hands the result back as JSON text, so
+    // a string arrives quoted — the callback strips the quotes.
+    private val turnstileScript = """
+        (function(){
+          var p = document.getElementById('cfPlayer');
+          if (p) { var s = p.getAttribute('src'); if (s && s.indexOf('http') === 0) return s; }
+          var v = document.getElementById('cfVlc');
+          if (v) { var h = v.getAttribute('href'); if (h && h.indexOf('http') === 0) return h; }
+          var box = document.getElementById('cfTsBox');
+          if (box && box.querySelector('iframe')) return 'SHOW_SHEET';
+          return '';
+        })()
+    """.trimIndent()
+
+    // The placeholder is a fixed 271,708-byte mp4. A HEAD request
+    // reveals its Content-Length; a real movie file is orders of
+    // magnitude larger. Fail open (accept the URL) when the HEAD fails
+    // or carries no length, so a host quirk never blocks a real stream.
+    private fun isRealVideo(url: String): Boolean {
+        return try {
+            val len = app.head(url, headers = mapOf("Referer" to "https://cinefreak.net/"))
+                .headers["Content-Length"]?.toLongOrNull()
+            len == null || len >= 1_000_000L
+        } catch (e: Exception) {
+            true
+        }
+    }
+
+    // Watch token -> WebViewResolver: load the CineCloud player page in
+    // the app's browser, let Turnstile solve there, and capture the
+    // real video URL the page requests (intercepted R2 request first,
+    // the script's read of the page second). Returns null when the
+    // resolver yields nothing (no WebView host, the person dismissed
+    // the check, or Turnstile never solved) or when the URL it yields
+    // is the placeholder — the caller then falls back to the plain
+    // flows. A candidate that is not a real video is never returned.
+    private suspend fun resolveWatchTokenViaWebView(token: String): String? {
+        val scriptUrl = AtomicReference<String?>(null)
+        val resolver = WebViewResolver(
+            interceptUrl = Regex("""\.r2\.dev/.*\.(mp4|mkv|mov)"""),
+            script = turnstileScript,
+            scriptCallback = { raw ->
+                val decoded = raw.trim().removeSurrounding("\"")
+                if (decoded.startsWith("http")) scriptUrl.set(decoded)
+            },
+            timeout = 60_000L
+        )
+        val (request, _) = try {
+            resolver.resolveUsingWebView(
+                "https://cinecloud.top/f/$token",
+                "https://cinefreak.net/"
+            )
+        } catch (e: Exception) {
+            null to emptyList()
+        }
+        val url = request?.url?.toString()?.takeIf { it.startsWith("http") }
+            ?: scriptUrl.get()?.takeIf { it.startsWith("http") }
+        return url?.takeIf { isRealVideo(it) }
+    }
 
     private fun cineHeaders(token: String): Map<String, String> {
         return browserHeaders + mapOf("Referer" to "https://cinecloud.top/f/$token")
@@ -420,23 +494,54 @@ class CineFreakProvider : MainAPI() {
             return true
         }
 
-        // Resolves one quality group: watch token first (a=play is ONE
-        // call that returns the file URL directly), download token as
-        // fallback (n -> unlock -> server 307). Returns true if a
-        // stream was emitted for this group.
+        // Once per loadLinks: whether the browser (Turnstile) solve has
+        // already failed — after that, groups skip it and use the plain
+        // flows, so the person is not asked to tick the checkbox again.
+        var webViewFailed = false
+
+        // Resolves one quality group: browser watch token first (the
+        // Turnstile fix — the page's own JS returns the real file),
+        // plain watch token next (works only when enforcement is off),
+        // download token last (n -> unlock -> server 307). A candidate
+        // URL is only accepted when isRealVideo says it is not the
+        // 60-second placeholder. Returns true if a stream was emitted
+        // for this group.
         suspend fun resolveGroup(label: String, entries: List<LinkEntry>): Boolean {
             val quality = entries.firstOrNull()?.quality ?: Qualities.Unknown.value
             var direct: String? = null
-            for (entry in entries) {
-                if (entry.host != "watch") continue
-                direct = resolveWatchToken(entry.id)
-                if (direct != null) break
+            // 1) Watch token through the app's browser (Turnstile).
+            // Only until it fails once per loadLinks: if the browser
+            // solve yields nothing (the person dismissed the check, or
+            // Turnstile never solved), do not nag them again for the
+            // next quality — fall through to the plain flows.
+            if (!webViewFailed) {
+                for (entry in entries) {
+                    if (entry.host != "watch") continue
+                    direct = resolveWatchTokenViaWebView(entry.id)
+                    if (direct != null) break
+                }
+                if (direct == null) webViewFailed = true
             }
+            // 2) Plain watch token (a=play, no Turnstile token).
+            if (direct == null) {
+                for (entry in entries) {
+                    if (entry.host != "watch") continue
+                    val candidate = resolveWatchToken(entry.id)
+                    if (candidate != null && isRealVideo(candidate)) {
+                        direct = candidate
+                        break
+                    }
+                }
+            }
+            // 3) Download token (n -> unlock -> server 307).
             if (direct == null) {
                 for (entry in entries) {
                     if (entry.host != "dl") continue
-                    direct = resolveDownloadToken(entry.id)
-                    if (direct != null) break
+                    val candidate = resolveDownloadToken(entry.id)
+                    if (candidate != null && isRealVideo(candidate)) {
+                        direct = candidate
+                        break
+                    }
                 }
             }
             return if (direct != null) emit(label, quality, direct) else false
@@ -449,10 +554,12 @@ class CineFreakProvider : MainAPI() {
         }
         if (found) return true
 
-        // Pass 2 (only if pass 1 found NOTHING — e.g. a short
-        // Turnstile enforcement blip): wait, then resolve every group
-        // again with fresh nonces. Thread.sleep, not coroutines delay:
-        // kotlinx-coroutines is not on this module's compile classpath.
+        // Pass 2 (only if pass 1 found NOTHING): wait, then resolve
+        // every group again with fresh nonces. The browser solve is
+        // skipped here (webViewFailed is already set when it failed in
+        // pass 1), so pass 2 only retries the plain flows.
+        // Thread.sleep, not coroutines delay: kotlinx-coroutines is not
+        // on this module's compile classpath.
         Thread.sleep(5000)
         for ((label, entries) in groups) {
             if (resolveGroup(label, entries)) found = true

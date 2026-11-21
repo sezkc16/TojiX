@@ -199,6 +199,31 @@ class WatchAnimeWorldProvider : MainAPI() {
         }
     }
 
+    // Post ID from <body class="... postid-2344 ..."> (WordPress renders
+    // it on every single post page). Needed for the theme's season AJAX.
+    private fun parsePostId(doc: Document): String? {
+        val bodyClass = doc.selectFirst("body")?.attr("class") ?: return null
+        return Regex("postid-(\\d+)").find(bodyClass)?.groupValues?.get(1)
+    }
+
+    // The theme loads a season's episodes via admin-ajax:
+    // GET /wp-admin/admin-ajax.php?action=action_select_season&season=N&post=<id>
+    // Response is the episode list HTML (same markup as the page).
+    // Verified live 2026-11-22: Arifureta S1 returns episode links;
+    // series with no episodes return an empty body.
+    private suspend fun fetchSeasonAjax(postId: String, season: Int, poster: String?): List<Episode> {
+        val html = try {
+            app.get(
+                "$mainUrl/wp-admin/admin-ajax.php?action=action_select_season&season=$season&post=$postId",
+                headers = browserHeaders
+            ).text
+        } catch (e: Exception) { return emptyList() }
+        if (html.isBlank()) return emptyList()
+        val list = mutableListOf<Episode>()
+        collectEpisodes(Jsoup.parse(html), poster, list, mutableSetOf())
+        return list
+    }
+
     override suspend fun load(url: String): LoadResponse? {
         val html = app.get(url, headers = browserHeaders).text
         val doc = Jsoup.parse(html)
@@ -221,20 +246,46 @@ class WatchAnimeWorldProvider : MainAPI() {
             }
         }
 
-        // Series: this page lists the latest season's episodes; the
-        // season selector is JS (admin-ajax), but every season also has
-        // a plain /season/<slug>-<n>/ page, so fetch the other seasons
-        // directly and merge (dedup by episode URL).
+        // Series: the page only ever renders the LATEST season's
+        // episodes in HTML. Other seasons come from the theme's own
+        // admin-ajax endpoint (action_select_season) or the plain
+        // /season/<slug>-<n>/ pages.
+        // NOTE (verified live 2026-11-22): the site's newest series
+        // (e.g. Big Hero 6, Firefly Wedding, Zatch Bell) have NO
+        // episodes attached at all — the page carries no episode
+        // section, the AJAX returns empty, search finds no episode
+        // posts and guessed episode URLs 404. For those we return the
+        // series with an empty episode list instead of null, so the
+        // detail page renders instead of throwing "returned nothing".
         val slug = url.trimEnd('/').substringAfterLast("/")
         val seasons = doc.select(".sel-temp a[data-season]")
             .mapNotNull { it.attr("data-season").toIntOrNull() }.distinct().sorted()
-        val currentSeason = doc.selectFirst(".n_s")?.text()?.trim()?.toIntOrNull()
+        val postId = parsePostId(doc)
+            ?: doc.selectFirst(".sel-temp a[data-post]")?.attr("data-post")?.takeIf { it.isNotEmpty() }
         val episodes = mutableListOf<Episode>()
         val seen = mutableSetOf<String>()
         collectEpisodes(doc, poster, episodes, seen)
-        val otherSeasons = seasons.filter { it != currentSeason }
-        if (otherSeasons.isNotEmpty()) {
-            val extra: List<List<Episode>> = otherSeasons.amap { sn ->
+        // Probe every known season via the theme's AJAX endpoint. If the
+        // page has no season selector at all, probe S1-S3 anyway — the
+        // selector can be missing while episodes exist via AJAX.
+        val seasonNumbers = seasons.ifEmpty { listOf(1, 2, 3) }
+        if (postId != null) {
+            val extra: List<List<Episode>> = seasonNumbers.amap { sn ->
+                try {
+                    fetchSeasonAjax(postId, sn, poster)
+                } catch (e: Exception) { emptyList() }
+            }
+            for (list in extra) for (ep in list) {
+                if (seen.add(ep.data)) episodes.add(ep)
+            }
+        }
+        // Fallback for seasons the AJAX did not return: plain
+        // /season/<slug>-<n>/ pages (v1's approach). Only when the
+        // season numbers are real (from .sel-temp), to avoid wasted
+        // requests on series that simply have no episodes.
+        val missing = seasons.filter { sn -> episodes.none { it.season == sn } }
+        if (missing.isNotEmpty()) {
+            val extra: List<List<Episode>> = missing.amap { sn ->
                 try {
                     val sDoc = Jsoup.parse(
                         app.get("$mainUrl/season/$slug-$sn/", headers = browserHeaders).text
@@ -248,7 +299,6 @@ class WatchAnimeWorldProvider : MainAPI() {
                 if (seen.add(ep.data)) episodes.add(ep)
             }
         }
-        if (episodes.isEmpty()) return null
         episodes.sortWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
             this.posterUrl = poster
@@ -331,8 +381,12 @@ class WatchAnimeWorldProvider : MainAPI() {
         var found = false
 
         // ---- Server 1 (default): as-cdn26.top embed ----
-        val embedUrl = doc.selectFirst("#options-0 iframe[src]")?.attr("src")
-            ?: doc.selectFirst("iframe[src*=as-cdn]")?.attr("src")
+        // The iframe carries both src and data-src (same URL); read
+        // src first, data-src as fallback (some pages lazy-load it).
+        val embedUrl = doc.selectFirst("#options-0 iframe[src]")?.attr("src")?.takeIf { it.isNotEmpty() }
+            ?: doc.selectFirst("#options-0 iframe[data-src]")?.attr("data-src")?.takeIf { it.isNotEmpty() }
+            ?: doc.selectFirst("iframe[src*=as-cdn]")?.attr("src")?.takeIf { it.isNotEmpty() }
+            ?: doc.selectFirst("iframe[data-src*=as-cdn]")?.attr("data-src")?.takeIf { it.isNotEmpty() }
         if (!embedUrl.isNullOrEmpty()) {
             val fullEmbed = fixUrl(embedUrl)
             for (media in scrapeEmbedMedia(fullEmbed, pageUrl)) {
@@ -357,8 +411,9 @@ class WatchAnimeWorldProvider : MainAPI() {
         // iframe data-src="/api/player1.php?data=<b64 JSON>" — the JSON
         // maps each audio language to a short.icu link. Some episodes
         // only have Server 1, so this block is optional.
-        val playerData = doc.selectFirst("#options-1 iframe[data-src]")?.attr("data-src")
-            ?: doc.selectFirst("iframe[data-src*=player1.php]")?.attr("data-src")
+        val playerData = doc.selectFirst("#options-1 iframe[data-src]")?.attr("data-src")?.takeIf { it.isNotEmpty() }
+            ?: doc.selectFirst("iframe[data-src*=player1.php]")?.attr("data-src")?.takeIf { it.isNotEmpty() }
+            ?: doc.selectFirst("iframe[src*=player1.php]")?.attr("src")?.takeIf { it.isNotEmpty() }
         val langLinks = playerData
             ?.substringAfter("data=", "")
             ?.takeIf { it.isNotEmpty() }

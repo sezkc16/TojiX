@@ -32,6 +32,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.net.URLDecoder
 import java.util.Base64
 
 class AnimeSaltProvider : MainAPI() {
@@ -442,7 +443,19 @@ class AnimeSaltProvider : MainAPI() {
 
     private fun decodePlayerData(b64: String): List<LangLink> {
         return try {
-            val json = String(Base64.getDecoder().decode(b64), Charsets.UTF_8)
+            // The Plyr "data" param is URL-encoded: base64 padding "=" arrives
+            // as "%3D" (and "+" / "/" as "%2B" / "%2F") — "%" is an illegal
+            // base64 char, so the raw string must be URL-decoded FIRST.
+            // (e.g. "A Wild Last Boss Appeared! 1x1" ends in "%3D%3D" and
+            // decoded to nothing before this fix.) The "+" guard keeps a
+            // literal "+" in the base64 from becoming a space (URLDecoder
+            // treats "+" as a space in form encoding).
+            val json = String(
+                Base64.getDecoder().decode(
+                    URLDecoder.decode(b64.replace("+", "%2B"), Charsets.UTF_8)
+                ),
+                Charsets.UTF_8
+            )
             tryParseJson<List<LangLink>>(json) ?: emptyList()
         } catch (e: Exception) { emptyList() }
     }

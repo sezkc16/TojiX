@@ -2,6 +2,8 @@ package com.hdhub4u
 
 import java.util.Base64 as JavaBase64
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.lagradost.cloudstream3.Actor
+import com.lagradost.cloudstream3.ActorData
 import com.lagradost.cloudstream3.Episode
 import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.HomePageResponse
@@ -29,6 +31,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
 
 class HDHub4uProvider : MainAPI() {
 
@@ -98,6 +101,34 @@ class HDHub4uProvider : MainAPI() {
             }
         }
         return null
+    }
+
+    // Cast from the post page's metadata block, e.g.
+    // "<strong>Stars:</strong> Georgina Campbell, Joe Keery, Liam Neeson"
+    // (verified live on movie AND series pages). Plain comma-separated
+    // names — no roles, no actor images, so roleString and image stay
+    // null. A trailing "& Others" / "and Others" is stripped. The site
+    // has NO related-titles block on post pages (the only "related"
+    // hit is a CSS rule), so recommendations stays unset — the More
+    // Like This row will not appear for this plugin. Returns at most
+    // 10 actors.
+    private fun parseStars(doc: Document): List<ActorData> {
+        val strong = doc.select("strong").firstOrNull {
+            it.ownText().trim().equals("Stars:", ignoreCase = true)
+        } ?: return emptyList()
+        val value = strong.parent()?.text()
+            ?.substringAfter("Stars:", "")?.trim().orEmpty()
+        if (value.isEmpty()) return emptyList()
+        return value.split(",")
+            .map { part ->
+                part.trim()
+                    .replace(Regex("(?i)\\s*(?:&|and)\\s+others\\s*$"), "")
+                    .trim()
+            }
+            .filter { it.isNotEmpty() && !it.equals("others", ignoreCase = true) }
+            .distinct()
+            .take(10)
+            .map { ActorData(Actor(it)) }
     }
 
     private fun toJson(data: EpisodeData): String? {
@@ -186,6 +217,7 @@ class HDHub4uProvider : MainAPI() {
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
             ?: doc.selectFirst("div.post-content img, article img, .post img")?.attr("src")
         val description = parseDescription(doc)
+        val actors = parseStars(doc)
         val isSeries = url.contains("-full-series/") || title.contains("Season", true)
 
         if (isSeries) {
@@ -316,6 +348,7 @@ class HDHub4uProvider : MainAPI() {
             return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
                 this.posterUrl = poster
                 this.plot = description
+                this.actors = actors.takeIf { it.isNotEmpty() }
             }
         } else {
             // Movie: collect EVERY quality download link (hubcdn + hubdrive),
@@ -359,6 +392,7 @@ class HDHub4uProvider : MainAPI() {
             return newMovieLoadResponse(title, url, TvType.Movie, dataJson) {
                 this.posterUrl = poster
                 this.plot = description
+                this.actors = actors.takeIf { it.isNotEmpty() }
             }
         }
     }

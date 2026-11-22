@@ -340,16 +340,49 @@ class CineFreakProvider : MainAPI() {
     // polled every 2 s): the video URL once the page's own play() has
     // set it (cfPlayer iframe src, or cfVlc anchor href), SHOW_SHEET
     // while the Turnstile widget waits for a person (the app then shows
-    // the page so the person can tick the checkbox), PAGE_FAILED when
-    // the page itself has failed (its fail() set #cfMsg to an error, or
-    // it left for another document — e.g. the not_ready redirect), or
-    // '' while it is still loading. The engine hands the result back as
-    // JSON text, so a string arrives quoted — the callback strips the
-    // quotes. The stage matters: a failed page is worth retrying on the
-    // next quality group (it ends fast), while a dismissed sheet is
-    // not (the person already said no).
+    // the page so the person can tick the checkbox), NEEDS_WIDGET when
+    // Turnstile's script loaded but its widget never rendered in the
+    // hidden page (the app then shows the page too — a hidden page
+    // cannot render the widget at all, so waiting for it is a
+    // deadlock), PAGE_FAILED when the page itself has failed (its fail()
+    // set #cfMsg to an error, it left for another document, or it
+    // reloaded into the not_ready loop), or '' while it is still
+    // loading. The engine hands the result back as JSON text, so a
+    // string arrives quoted — the callback strips the quotes. The stage
+    // matters: a failed page is worth retrying on the next quality
+    // group (it ends fast), while a dismissed sheet is not (the person
+    // already said no).
+    //
+    // The page has two server variants (UA-dependent): desktop serves an
+    // inline player (#cfPlayer iframe + #cfMsg), iOS serves a "Stream on
+    // iPhone" card (#cfVlc anchor + #cfDot/#cfSrc). Both share #cfTsBox
+    // and the same Turnstile script, and the phone diagnostic (b124:
+    // `turnstile: yes | widget: no | vlc: yes`) is the iOS variant.
+    // The branches below are per-variant, not dead: each variant lacks
+    // the other's elements, so every element is checked for existence
+    // before it is read.
     private val turnstileScript = """
         (function(){
+          // The not_ready reload loop: the player sends the page to the
+          // same URL again when no server has the file yet. A reload
+          // resets this script's own state but not sessionStorage, so
+          // count loads per token; the second load without progress ends
+          // the resolve fast (PAGE_FAILED). A fresh load (Retry, or a
+          // new title) resets the count.
+          try {
+            var navType = (performance.getEntriesByType('navigation')[0] || {}).type;
+            var loadKey = '__cfLoads:' + location.pathname;
+            if (!window.__cfLoadCounted) {
+              window.__cfLoadCounted = true;
+              if (navType === 'reload') {
+                var n = parseInt(sessionStorage.getItem(loadKey) || '0', 10) + 1;
+                sessionStorage.setItem(loadKey, String(n));
+                if (n >= 2) return 'PAGE_FAILED';
+              } else {
+                sessionStorage.setItem(loadKey, '1');
+              }
+            }
+          } catch (e) {}
           var p = document.getElementById('cfPlayer');
           if (p) { var s = p.getAttribute('src'); if (s && s.indexOf('http') === 0) return s; }
           var v = document.getElementById('cfVlc');
@@ -358,7 +391,19 @@ class CineFreakProvider : MainAPI() {
           if (box && box.querySelector('iframe')) return 'SHOW_SHEET';
           var m = document.getElementById('cfMsg');
           if (m) { var t = (m.textContent || '').trim(); if (t && t !== 'Loading...') return 'PAGE_FAILED'; }
-          if (document.readyState !== 'loading' && !p && !box) return 'PAGE_FAILED';
+          // The player left for another document: none of its markers exist.
+          if (document.readyState !== 'loading' && !p && !v && !box) return 'PAGE_FAILED';
+          // Turnstile loaded but its widget never rendered: the hidden
+          // page cannot show it, so ask the app to show the page. Give
+          // a silent auto-solve a few seconds first (it needs no widget
+          // and sets the URL above), then stop waiting.
+          if (window.turnstile && box && document.readyState !== 'loading') {
+            var now = Date.now();
+            if (!window.__cfTsWaitStart) window.__cfTsWaitStart = now;
+            if (now - window.__cfTsWaitStart > 4000) return 'NEEDS_WIDGET';
+          } else if (!window.turnstile) {
+            window.__cfTsWaitStart = 0;
+          }
           return '';
         })()
     """.trimIndent()
@@ -366,10 +411,11 @@ class CineFreakProvider : MainAPI() {
     // What the last browser attempt ended as: "failed" when the page
     // itself failed (PAGE_FAILED), "needs_person" when its Turnstile
     // widget waited for a person (SHOW_SHEET — the sheet was shown and
-    // the person closed it, or it timed out unseen), "" while it is
-    // still running or never reported a stage. Read after
-    // resolveWatchTokenViaWebView returns null: only a "failed" stage
-    // is worth retrying on the next quality group.
+    // the person closed it, or it timed out unseen) or never rendered
+    // in the hidden page (NEEDS_WIDGET — the sheet was shown for the
+    // same reason), "" while it is still running or never reported a
+    // stage. Read after resolveWatchTokenViaWebView returns null: only
+    // a "failed" stage is worth retrying on the next quality group.
     private val lastBrowserStage = AtomicReference("")
 
     // The placeholder is a fixed 271,708-byte mp4. A HEAD request
@@ -405,7 +451,7 @@ class CineFreakProvider : MainAPI() {
                 val decoded = raw.trim().removeSurrounding("\"")
                 if (decoded.startsWith("http")) {
                     scriptUrl.set(decoded)
-                } else if (decoded == "SHOW_SHEET") {
+                } else if (decoded == "SHOW_SHEET" || decoded == "NEEDS_WIDGET") {
                     lastBrowserStage.set("needs_person")
                 } else if (decoded == "PAGE_FAILED") {
                     lastBrowserStage.set("failed")

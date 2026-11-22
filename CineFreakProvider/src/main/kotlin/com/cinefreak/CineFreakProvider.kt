@@ -340,9 +340,14 @@ class CineFreakProvider : MainAPI() {
     // polled every 2 s): the video URL once the page's own play() has
     // set it (cfPlayer iframe src, or cfVlc anchor href), SHOW_SHEET
     // while the Turnstile widget waits for a person (the app then shows
-    // the page so the person can tick the checkbox), or '' while it is
-    // still loading. The engine hands the result back as JSON text, so
-    // a string arrives quoted — the callback strips the quotes.
+    // the page so the person can tick the checkbox), PAGE_FAILED when
+    // the page itself has failed (its fail() set #cfMsg to an error, or
+    // it left for another document — e.g. the not_ready redirect), or
+    // '' while it is still loading. The engine hands the result back as
+    // JSON text, so a string arrives quoted — the callback strips the
+    // quotes. The stage matters: a failed page is worth retrying on the
+    // next quality group (it ends fast), while a dismissed sheet is
+    // not (the person already said no).
     private val turnstileScript = """
         (function(){
           var p = document.getElementById('cfPlayer');
@@ -351,9 +356,21 @@ class CineFreakProvider : MainAPI() {
           if (v) { var h = v.getAttribute('href'); if (h && h.indexOf('http') === 0) return h; }
           var box = document.getElementById('cfTsBox');
           if (box && box.querySelector('iframe')) return 'SHOW_SHEET';
+          var m = document.getElementById('cfMsg');
+          if (m) { var t = (m.textContent || '').trim(); if (t && t !== 'Loading...') return 'PAGE_FAILED'; }
+          if (document.readyState !== 'loading' && !p && !box) return 'PAGE_FAILED';
           return '';
         })()
     """.trimIndent()
+
+    // What the last browser attempt ended as: "failed" when the page
+    // itself failed (PAGE_FAILED), "needs_person" when its Turnstile
+    // widget waited for a person (SHOW_SHEET — the sheet was shown and
+    // the person closed it, or it timed out unseen), "" while it is
+    // still running or never reported a stage. Read after
+    // resolveWatchTokenViaWebView returns null: only a "failed" stage
+    // is worth retrying on the next quality group.
+    private val lastBrowserStage = AtomicReference("")
 
     // The placeholder is a fixed 271,708-byte mp4. A HEAD request
     // reveals its Content-Length; a real movie file is orders of
@@ -380,12 +397,19 @@ class CineFreakProvider : MainAPI() {
     // flows. A candidate that is not a real video is never returned.
     private suspend fun resolveWatchTokenViaWebView(token: String): String? {
         val scriptUrl = AtomicReference<String?>(null)
+        lastBrowserStage.set("")
         val resolver = WebViewResolver(
             interceptUrl = Regex("""\.r2\.dev/.*\.(mp4|mkv|mov)"""),
             script = turnstileScript,
             scriptCallback = { raw ->
                 val decoded = raw.trim().removeSurrounding("\"")
-                if (decoded.startsWith("http")) scriptUrl.set(decoded)
+                if (decoded.startsWith("http")) {
+                    scriptUrl.set(decoded)
+                } else if (decoded == "SHOW_SHEET") {
+                    lastBrowserStage.set("needs_person")
+                } else if (decoded == "PAGE_FAILED") {
+                    lastBrowserStage.set("failed")
+                }
             },
             timeout = 60_000L
         )
@@ -496,8 +520,11 @@ class CineFreakProvider : MainAPI() {
         }
 
         // Once per loadLinks: whether the browser (Turnstile) solve has
-        // already failed — after that, groups skip it and use the plain
-        // flows, so the person is not asked to tick the checkbox again.
+        // already failed in a way not worth retrying — after that, groups
+        // skip it and use the plain flows, so the person is not asked to
+        // tick the checkbox again. A page that failed by itself
+        // (PAGE_FAILED — Turnstile errored, or the player left) does NOT
+        // set it: that ends fast, and the next group's page may work.
         var webViewFailed = false
 
         // Resolves one quality group: browser watch token first (the
@@ -521,7 +548,10 @@ class CineFreakProvider : MainAPI() {
                     direct = resolveWatchTokenViaWebView(entry.id)
                     if (direct != null) break
                 }
-                if (direct == null) webViewFailed = true
+                // Only a dismissed sheet (or a silent timeout) gives up
+                // the browser for the rest of this loadLinks; a page
+                // that failed by itself is retried on the next group.
+                if (direct == null && lastBrowserStage.get() != "failed") webViewFailed = true
             }
             // 2) Plain watch token (a=play, no Turnstile token).
             if (direct == null) {

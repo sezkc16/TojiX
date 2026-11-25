@@ -166,14 +166,22 @@ class FourKHDHubProvider : MainAPI() {
         return out.take(10)
     }
 
+    // NOTE 2026-11-25: the Hindi/English/Hindi-Series rows were REMOVED
+    // (v8). The site tags nearly every title multi-audio (Hindi +
+    // English, often + Tamil + Telugu), so its language categories do
+    // NOT separate anything: Movies vs English Movies share 17/18
+    // cards, Hindi vs English share 10/18, Series vs Hindi Series
+    // 12/18 — and every row opened with the same newest titles (The
+    // Mosquito Bowl first in all of them). The phone showed the same
+    // section under different names. The remaining rows are genuinely
+    // distinct lists (verified live: JioHotstar/Anime share 0/18 with
+    // Latest, Disney/IMDb 1/18, 4K HDR 2/18, Korean 3/18, Netflix 4/18).
+    // Do NOT re-add language rows unless the site starts separating them.
     override val mainPage = mainPageOf(
         "" to "Latest Releases",
         "category/movies/" to "Movies",
-        "category/hindi-movies/" to "Hindi Movies",
-        "category/english-movies/" to "English Movies",
         "category/series/" to "Latest Episodes",
         "category/korean-series/" to "Korean Series",
-        "category/hindi-series/" to "Hindi Series",
         "category/netflix/" to "Netflix",
         "category/jiohotstar/" to "JioHotstar",
         "category/disney/" to "Disney+",

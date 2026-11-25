@@ -1,5 +1,5 @@
 // Use an integer for version numbers
-version = 7
+version = 8
 
 cloudstream {
     description = "Movies & TV Shows in 4K HDR, 2160p, 1080p from 4KHDHub"

@@ -29,7 +29,14 @@ import org.jsoup.Jsoup
 
 class VegamoviesProvider : MainAPI() {
 
-    override var mainUrl = "https://vegamovies13.co.in"
+    // Domain moved 2026-11-25: vegamovies13.co.in -> vegamovies17.co.in.
+    // The old domain 301s EVERYTHING (incl. /bollywood-movies/ and the
+    // /uploads/posts/covers/*.webp posters) to the new domain's ROOT, so
+    // on the old domain every Home row showed the same latest listing
+    // and every poster was a broken image (phone report 2026-11-25).
+    // If it moves again: same symptom = domain moved; find the new one
+    // from the old domain's Location header and update mainUrl + iconUrl.
+    override var mainUrl = "https://vegamovies17.co.in"
     override var name = "Vegamovies"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
     override var lang = "en"
